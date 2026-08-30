@@ -6,8 +6,7 @@ Example:
       --input-dir rec_sample --output-dir split成果_mov_auto
 
 The source MP4 files are never modified. Video and audio are copied without
-re-encoding into MOV containers. This file is kept as a postfix-named version
-so the previous production script remains available unchanged.
+re-encoding into MOV containers.
 """
 
 import argparse
@@ -24,7 +23,7 @@ from threading import Lock
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.0 (rev2.5d engine)"
+SPLITTER_VERSION = "1.0"
 NAME_LOCK = Lock()
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo frame pipeline used by the public rev2.5d-based detector."""
+"""Tapo frame pipeline used by the public splitter."""
 
 import argparse
 import json
