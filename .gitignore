@@ -1,0 +1,20 @@
+# 利用者ごとに生成される設定・OSDテンプレート・学習素材
+*.json
+!package.json
+tapo_training_samples/
+
+# 録画データと分割成果物
+*.mp4
+*.mov
+Output/
+split_output/
+
+# Python・OS・ローカル環境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# 過去スナップショット（履歴はGitで管理）
+archive/
