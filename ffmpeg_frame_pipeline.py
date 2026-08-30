@@ -12,7 +12,8 @@ import cv2
 import numpy as np
 
 from tapo_osd_common import load_templates, recognize_osd, save_pair, detect_osd_stalls
-from make_tapo_verified_font import BASE, FONT_PATH
+BASE = Path(__file__).resolve().parent
+FONT_PATH = BASE / "tapo_osd_glyph_templates.json"
 
 STEP = 15.0
 TOLERANCE = 3.0

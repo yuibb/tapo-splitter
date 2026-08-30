@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from make_tapo_verified_font import extract_glyphs_from_gray, recognize
+from tapo_osd_recognizer import extract_glyphs_from_gray, recognize
 
 OSD_WIDTH, OSD_HEIGHT = 950, 70
 MIN_MARGIN = 80
