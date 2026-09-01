@@ -35,8 +35,11 @@ def load_config():
     if CONFIG.exists():
         try:
             data = json.loads(CONFIG.read_text(encoding="utf-8"))
-            keys = ("recdata_dir", "output_dir", "template_json")
+            keys = ("recdata_dir", "output_dir")
             if all(str(data.get(key, "")).strip() for key in keys):
+                # The template is always managed beside this launcher. Do not
+                # ask the user to locate it on every first-run setup.
+                data["template_json"] = str(DEFAULT_TEMPLATE)
                 return data
         except (OSError, json.JSONDecodeError):
             pass
@@ -44,12 +47,11 @@ def load_config():
     print("初回設定を行います。")
     recdata = ask_path("録画データフォルダ", DEFAULT_RECDATA)
     output = ask_path("分割結果の出力フォルダ", DEFAULT_OUTPUT)
-    template = ask_path("OSDテンプレートJSON", DEFAULT_TEMPLATE)
     data = {
         "version": 1,
         "recdata_dir": str(recdata),
         "output_dir": str(output),
-        "template_json": str(template),
+        "template_json": str(DEFAULT_TEMPLATE),
     }
     CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return data
