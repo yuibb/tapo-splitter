@@ -3,7 +3,11 @@
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
-if command -v python3 >/dev/null 2>&1; then
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+  "$SCRIPT_DIR/.venv/bin/python" run_tapo_splitter.py "$@"
+elif [[ -x "$SCRIPT_DIR/../.c230-venv/bin/python" ]]; then
+  "$SCRIPT_DIR/../.c230-venv/bin/python" run_tapo_splitter.py "$@"
+elif command -v python3 >/dev/null 2>&1; then
   python3 run_tapo_splitter.py "$@"
 elif command -v python >/dev/null 2>&1; then
   python run_tapo_splitter.py "$@"
@@ -12,12 +16,12 @@ else
   exit 1
 fi
 
-status=$?
+exit_code=$?
 echo
-if (( status != 0 )); then
-  echo "処理が失敗しました（終了コード: $status）。"
+if (( exit_code != 0 )); then
+  echo "処理が失敗しました（終了コード: $exit_code）。"
 else
   echo "処理が完了しました。"
 fi
 read -r "?Enterキーを押すと閉じます。"
-exit $status
+exit $exit_code
