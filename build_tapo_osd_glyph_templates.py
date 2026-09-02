@@ -84,6 +84,8 @@ def write_json(path, labels, templates, target=TARGET_PER_DIGIT):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", type=Path,
+                        help="録画データフォルダ（省略時は対話入力）")
     parser.add_argument("--output", type=Path, default=Path(OUTPUT_NAME))
     parser.add_argument("--round-size", type=int, default=ROUND_SIZE)
     parser.add_argument("--samples-per-digit", type=int, default=TARGET_PER_DIGIT,
@@ -123,8 +125,8 @@ def main():
     else:
         labels, templates = {}, defaultdict(list)
 
-    folder_text = input("録画データフォルダのパス: ").strip()
-    folder = Path(folder_text).expanduser()
+    folder = (args.input_dir.expanduser() if args.input_dir else
+              Path(input("録画データフォルダのパス: ").strip()).expanduser())
     videos = sorted(folder.rglob("*.mp4"))
     if not videos:
         raise SystemExit("MP4が見つかりません。録画フォルダを確認してください。")

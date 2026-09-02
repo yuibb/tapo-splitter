@@ -176,7 +176,7 @@ def main():
         for item in toc:
             handle.write(f"{item['video_seconds']:.3f}\t{item['formatted']}\t"
                          f"{item['threshold']}\t{item['margin']}\n")
-    report = {"version": "1.0", "engine": "public",
+    report = {"version": "1.1", "engine": "public",
               "video": str(args.video), "font": str(args.font),
               "passes": [f"{args.coarse_step:g}-second pipe", f"{args.refine_step:g}-second candidate refinement",
                          "2-second refinement", "1-second final audit"],

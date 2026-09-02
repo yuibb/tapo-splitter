@@ -7,10 +7,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from tapo_osd_outline_fallback import extract_glyphs_from_outline
 from tapo_osd_recognizer import extract_glyphs_from_gray, recognize
 
 OSD_WIDTH, OSD_HEIGHT = 950, 70
 MIN_MARGIN = 80
+FALLBACK_MIN_MARGIN = 0
 STALL_SECONDS = 5.0
 
 
@@ -20,19 +22,32 @@ def load_templates(font_path):
             for d in "0123456789"}
 
 
-def recognize_osd(frame, templates):
-    gray = cv2.cvtColor(frame[:OSD_HEIGHT, :OSD_WIDTH], cv2.COLOR_BGR2GRAY)
-    glyphs, threshold = extract_glyphs_from_gray(gray, "video frame")
+def _recognize_glyphs(glyphs, templates, minimum_margin):
     digits, margins = [], []
     for glyph in glyphs:
         digit, _distance, margin = recognize(glyph, templates)
         digits.append(digit)
         margins.append(margin)
     value = "".join(digits)
-    if min(margins) < MIN_MARGIN:
+    if min(margins) < minimum_margin:
         raise RuntimeError(f"low recognition margin: {min(margins)}")
     timestamp = datetime.strptime(value, "%Y%m%d%H%M%S")
-    return timestamp, value, threshold, min(margins)
+    return timestamp, value, min(margins)
+
+
+def recognize_osd(frame, templates):
+    gray = cv2.cvtColor(frame[:OSD_HEIGHT, :OSD_WIDTH], cv2.COLOR_BGR2GRAY)
+    try:
+        glyphs, threshold = extract_glyphs_from_gray(gray, "video frame")
+        timestamp, value, margin = _recognize_glyphs(glyphs, templates, MIN_MARGIN)
+        return timestamp, value, threshold, margin
+    except Exception as primary_error:
+        try:
+            glyphs = extract_glyphs_from_outline(gray)
+            timestamp, value, margin = _recognize_glyphs(glyphs, templates, FALLBACK_MIN_MARGIN)
+            return timestamp, value, "outline", margin
+        except Exception:
+            raise primary_error
 
 
 def save_pair(output, index, before, after, delta):

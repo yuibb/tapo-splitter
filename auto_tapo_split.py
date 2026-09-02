@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo production splitter using Ver 1.0 (15→5→2→1 range-pipe) detection.
+"""Tapo production splitter using Ver 1.1.0 (15→5→2→1 range-pipe) detection.
 
 Example:
   .tapo-venv/bin/python auto_tapo_split.py \
@@ -23,7 +23,7 @@ from threading import Lock
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.0"
+SPLITTER_VERSION = "1.1.0"
 NAME_LOCK = Lock()
 
 
