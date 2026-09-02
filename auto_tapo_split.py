@@ -28,7 +28,6 @@ NAME_LOCK = Lock()
 
 
 def run(command):
-    print("+", " ".join(str(x) for x in command))
     subprocess.run(command, check=True)
 
 
@@ -118,6 +117,7 @@ def unique_path(path):
 
 
 def process_video(video, output_root, python_executable, font):
+    print(f"processing: {video.name}", flush=True)
     work = output_root / f".work_{video.stem}"
     work.mkdir(parents=True, exist_ok=True)
     report_dir = work / "jump_report"
@@ -225,6 +225,7 @@ def main():
     python_executable = sys.executable
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+    failed = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(process_video, video, args.output_dir,
@@ -232,7 +233,15 @@ def main():
             for video in videos
         }
         for future in as_completed(futures):
-            future.result()
+            video = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failed.append(video)
+                print(f"failed: {video.name} ({type(exc).__name__})", flush=True)
+    if failed:
+        names = ", ".join(video.name for video in failed)
+        raise SystemExit(f"{len(failed)} file(s) failed; remaining files were processed: {names}")
 
 
 if __name__ == "__main__":
