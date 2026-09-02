@@ -16,7 +16,7 @@ import numpy as np
 
 
 OUTPUT_NAME = "tapo_osd_glyph_templates.json"
-MIN_PER_DIGIT = 20
+TARGET_PER_DIGIT = 20
 ROUND_SIZE = 10
 MAX_ROUNDS_WITHOUT_PROGRESS = 3
 THRESHOLDS = (225, 235, 240, 245, 250)
@@ -62,15 +62,17 @@ def choose_video_frame(video, seconds):
     return (frame, actual) if ok else (None, actual)
 
 
-def write_json(path, labels, templates):
+def write_json(path, labels, templates, target=TARGET_PER_DIGIT):
+    counts = {d: len(templates[d]) for d in "0123456789"}
     data = {
         "format": "tapo_osd_glyph_templates_v1",
         "label_source": "user-confirmed OSD strings from personal recordings",
         "canvas": [64, 40],
+        "target_samples_per_digit": target,
         "labels": labels,
         "digits": {
             d: {
-                "sample_count": len(templates[d]),
+                "sample_count": counts[d],
                 "templates": [item["matrix"] for item in templates[d]],
                 "template_sources": [item["source"] for item in templates[d]],
             }
@@ -84,10 +86,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path(OUTPUT_NAME))
     parser.add_argument("--round-size", type=int, default=ROUND_SIZE)
-    parser.add_argument("--min-per-digit", type=int, default=MIN_PER_DIGIT)
+    parser.add_argument("--samples-per-digit", type=int, default=TARGET_PER_DIGIT,
+                        help="exact number of templates to keep for every digit (default: 20)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="ignore an existing output JSON and build a new one")
     args = parser.parse_args()
+    if args.samples_per_digit < 1:
+        raise SystemExit("--samples-per-digit must be at least 1")
+    target = args.samples_per_digit
 
-    if args.output.exists():
+    if args.output.exists() and not args.fresh:
         answer = input(f"{args.output} は既に存在します。再作成・積み増ししますか？ [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("中止しました。既存JSONは変更していません。")
@@ -105,9 +113,9 @@ def main():
                      "method": "existing", "matrix": matrix}
                     for i, matrix in enumerate(matrices)
                 ]
-                if len(items) > args.min_per_digit:
-                    indices = [round(i * (len(items) - 1) / (args.min_per_digit - 1))
-                               for i in range(args.min_per_digit)]
+                if len(items) > target:
+                    indices = [round(i * (len(items) - 1) / (target - 1))
+                               for i in range(target)] if target > 1 else [0]
                     items = [items[i] for i in indices]
                 templates[d].extend(items)
         except Exception as exc:
@@ -127,9 +135,12 @@ def main():
 
     while True:
         counts = Counter({d: len(templates[d]) for d in "0123456789"})
-        missing = [d for d in "0123456789" if counts[d] < args.min_per_digit]
+        missing = [d for d in "0123456789" if counts[d] < target]
         if not missing:
-            write_json(args.output, labels, templates)
+            counts = {d: len(templates[d]) for d in "0123456789"}
+            if any(count != target for count in counts.values()):
+                raise SystemExit(f"数字別サンプル数が不正です: {counts}")
+            write_json(args.output, labels, templates, target)
             print(f"完成: {args.output}")
             print("数字別サンプル数:", dict(counts))
             return
@@ -150,7 +161,7 @@ def main():
             print(f"\n[{index + 1}/{args.round_size}] {sample_path}")
             answer = input("OSD正解文字列 (YYYYMMDDHHMMSS / Enter=skip / q=abort): ").strip()
             if answer.lower() == "q":
-                write_json(args.output, labels, templates)
+                write_json(args.output, labels, templates, target)
                 raise SystemExit("ユーザー指定でabortしました。途中結果は保存済みです。")
             if len(answer) != 14 or not answer.isdigit():
                 continue
@@ -165,16 +176,16 @@ def main():
                 # Keep the final font balanced.  A labeled frame contains
                 # all 14 digits, so stop adding a digit once its quota is met
                 # instead of letting frequently occurring digits dominate.
-                if len(templates[digit]) >= args.min_per_digit:
+                if len(templates[digit]) >= target:
                     continue
                 templates[digit].append({"source": key, "method": f"binary_{threshold}", "matrix": glyph.tolist()})
             progress += 1
-            write_json(args.output, labels, templates)
+            write_json(args.output, labels, templates, target)
 
         if progress == 0:
             no_progress += 1
             if no_progress >= MAX_ROUNDS_WITHOUT_PROGRESS:
-                write_json(args.output, labels, templates)
+                write_json(args.output, labels, templates, target)
                 raise SystemExit("学習データを積み増せません。OSD表示・録画データを確認してください。")
         else:
             no_progress = 0
