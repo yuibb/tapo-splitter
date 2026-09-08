@@ -7,8 +7,7 @@ from pathlib import Path
 
 from tapo_osd_common import load_templates, save_pair
 from ffmpeg_frame_pipeline import (
-    TOLERANCE, coarse_frames, range_frames, probe_duration, record_from_frame, seek_record,
-    load_templates,
+    TOLERANCE, coarse_osd_frames, range_frames, probe_duration, record_from_frame,
 )
 
 STEP = 15.0
@@ -95,19 +94,11 @@ def main():
     coarse = []
     failures = []
     ocr_corrections = []
-    consecutive_failures = 0
-    for seconds, frame in coarse_frames(args.video, step=args.coarse_step):
+    for seconds, frame in coarse_osd_frames(args.video, step=args.coarse_step):
         try:
             coarse.append(record_from_frame(seconds, frame, templates))
-            consecutive_failures = 0
         except Exception as exc:
-            consecutive_failures += 1
             failures.append({"video_seconds": seconds, "error": str(exc)})
-            if consecutive_failures >= 5:
-                raise SystemExit(
-                    "OSD認識に5回連続で失敗したため中止しました。"
-                    "録画にOSDが表示されているか確認してください。"
-                )
     coarse = remove_transient_ocr(coarse, ocr_corrections)
     if not coarse:
         raise SystemExit("no recognizable coarse samples")
@@ -176,9 +167,11 @@ def main():
         for item in toc:
             handle.write(f"{item['video_seconds']:.3f}\t{item['formatted']}\t"
                          f"{item['threshold']}\t{item['margin']}\n")
-    report = {"version": "1.1", "engine": "public",
+    report = {"version": "1.2.0", "engine": "public",
               "video": str(args.video), "font": str(args.font),
-              "passes": [f"{args.coarse_step:g}-second pipe", f"{args.refine_step:g}-second candidate refinement",
+              "fastscan_transport": "rawvideo-gray-osd-crop",
+              "passes": [f"{args.coarse_step:g}-second OSD rawvideo FastScan",
+                         f"{args.refine_step:g}-second candidate refinement",
                          "2-second refinement", "1-second final audit"],
               "valid_samples": len(toc), "recognition_failures": failures,
               "ocr_transient_corrections": ocr_corrections,

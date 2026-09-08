@@ -7,12 +7,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from tapo_osd_outline_fallback import extract_glyphs_from_outline
+from tapo_osd_robust_scan import (
+    extract_glyphs_from_contrast_outline,
+    extract_glyphs_from_luma_search,
+    extract_glyphs_from_outline,
+)
 from tapo_osd_recognizer import extract_glyphs_from_gray, recognize
 
 OSD_WIDTH, OSD_HEIGHT = 950, 70
 MIN_MARGIN = 80
-FALLBACK_MIN_MARGIN = 0
+ROBUST_MIN_MARGIN = 80
 STALL_SECONDS = 5.0
 
 
@@ -36,18 +40,26 @@ def _recognize_glyphs(glyphs, templates, minimum_margin):
 
 
 def recognize_osd(frame, templates):
-    gray = cv2.cvtColor(frame[:OSD_HEIGHT, :OSD_WIDTH], cv2.COLOR_BGR2GRAY)
+    roi = frame[:OSD_HEIGHT, :OSD_WIDTH]
+    # FastScan supplies the already-cropped grayscale rawvideo directly.
+    # Keep accepting BGR frames for refinement and evidence paths.
+    gray = roi if roi.ndim == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     try:
         glyphs, threshold = extract_glyphs_from_gray(gray, "video frame")
         timestamp, value, margin = _recognize_glyphs(glyphs, templates, MIN_MARGIN)
         return timestamp, value, threshold, margin
     except Exception as primary_error:
-        try:
-            glyphs = extract_glyphs_from_outline(gray)
-            timestamp, value, margin = _recognize_glyphs(glyphs, templates, FALLBACK_MIN_MARGIN)
-            return timestamp, value, "outline", margin
-        except Exception:
-            raise primary_error
+        for method, extractor in (("raw_outline", extract_glyphs_from_outline),
+                                  ("contrast_outline", extract_glyphs_from_contrast_outline),
+                                  ("luma_search", extract_glyphs_from_luma_search)):
+            try:
+                glyphs = extractor(gray)
+                timestamp, value, margin = _recognize_glyphs(
+                    glyphs, templates, ROBUST_MIN_MARGIN)
+                return timestamp, value, method, margin
+            except Exception:
+                continue
+        raise primary_error
 
 
 def save_pair(output, index, before, after, delta):

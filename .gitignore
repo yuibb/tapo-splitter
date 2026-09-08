@@ -1,6 +1,7 @@
 # 利用者ごとに生成される設定・OSDテンプレート・学習素材
 *.json
 !package.json
+!tapo_osd_seed.json
 tapo_training_samples/
 
 # 録画データと分割成果物
@@ -18,3 +19,6 @@ venv/
 
 # 過去スナップショット（履歴はGitで管理）
 archive/
+
+# Notionへ転記するためのローカル開発メモ
+tapo-splitter-development-history.md

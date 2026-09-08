@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo OSD Splitter v1.1.0 single entry point."""
+"""Tapo OSD Splitter v1.2.0 single entry point."""
 
 import argparse
 import json
