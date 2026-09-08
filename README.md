@@ -1,8 +1,8 @@
-# Tapo録画ファイル スプリッター v1.2.0
+# Tapo録画ファイル スプリッター v1.3.0
 
 Tapoシリーズのカメラで録画したMP4を、カメラ映像内の日時OSD（画面表示）から読み取り、録画中に時刻がジャンプした位置で分割するPythonツールです。
 
-フォントデータは配布物に内蔵しません。初回利用時に、利用者自身の録画からOSDテンプレートJSONを作成します。
+標準ProfileはTapo C230の3K録画（2880×1620）です。Profileと、そのProfile用に作成したEliteFontは1セットとして扱います。初回利用時に、利用者自身の録画からOSDテンプレートJSONを作成します。
 
 ## 注意点
 
@@ -30,6 +30,7 @@ YYYYMMDD_HHMMSS_動画長さ.mov
 - **v1.0**: イニシャルリリース
 - **v1.1.0**: OSD認識に失敗した場合のアウトライン補助、数字ごとに20枚のテンプレートを収集する仕組み、設定変更モードを追加
 - **v1.2.0**: Fill Scan / Robust Scanの役割を整理し、初回Builder向けの粗いSeed補助、Geometry Baseline、Width Profileの審判情報、候補35枚から多様性を考慮してElite20を選ぶ仕組みを追加
+- **v1.3.0**: 解像度ごとのProfile＋EliteFontセット、active Profile選択、Profileと動画解像度の不一致時に誤認識せず停止する仕組みを追加
 
 ## 必要環境
 
@@ -52,6 +53,8 @@ YYYYMMDD_HHMMSS_動画長さ.mov
 - 録画フォルダと出力フォルダへの読み書き権限が必要です
 - 分割後ファイルを書き出す空き容量が必要です
 - 初回設定とJSON作成はターミナルで行います
+
+標準設定はTapo C230の3K録画です。2K録画や別機種を使用する場合は、Profile BuilderでROI・slot位置を作成し、そのProfileに対応するEliteFontを生成してください。
 
 ### macOS
 
@@ -91,19 +94,23 @@ py run_tapo_splitter.py
 
 コマンド入力なしで起動する場合は、Macでは`run_tapo_splitter.command`、Windowsでは`run_tapo_splitter.bat`をダブルクリックしてください。ランチャーは同梱または親フォルダの仮想環境を優先し、なければ通常のPythonを使用します。Macで初回だけ開けない場合は、ファイルを右クリックして「開く」を選びます。
 
-初回起動時はターミナル上で、録画データフォルダと分割結果の出力フォルダを指定します。OSDテンプレートJSONはこのフォルダ直下の固定ファイルを使用し、存在しない場合は録画からサンプル画像を抽出して作成します。付属の`tapo_osd_seed.json`（粗い構造判別データ）は初回の仮ラベル提案だけに使われ、明らかな候補は自動採用、曖昧な候補は利用者に確認します。確認・修正した結果から、利用環境用のElite20を作成します。Seedはフォントデータではなく、通常の動画認識で毎回使うものでもありません。作成時は数字ごとに35枚以上の候補を集め、多様性を考慮して最終20枚を選びます。
+初回起動時はターミナル上で、録画データフォルダと分割結果の出力フォルダを指定します。標準の`tapo_profiles.json`から動画の解像度に一致する`active: true`のProfileを選び、そのProfileに紐づくFont JSONを使用します。Profile用Fontがまだない場合は、そのProfile IDを埋め込んだFont JSONをBuilderが自動作成します。付属の`tapo_osd_seed.json`（粗い構造判別データ）は初回の仮ラベル提案だけに使われ、明らかな候補は自動採用、曖昧な候補は利用者に確認します。確認・修正した結果から、利用環境用のElite20を作成します。Seedはフォントデータではなく、通常の動画認識で毎回使うものでもありません。作成時は数字ごとに35枚以上の候補を集め、多様性を考慮して最終20枚を選びます。
+
+同じ解像度のProfileを複数登録する場合は、使用するものだけを`active: true`にしてください。解像度に一致するactive Profileがない、または複数ある場合は、誤ったFontで処理せず停止します。
+
+ProfileのROI・slot範囲は、FastScan、Fill/Outline/Lumaの補助認識、Font Builderで共通して使用されます。Profileを切り替えると、FontだけでなくOSDの切り出し位置と14桁のslot位置も切り替わります。
 
 既存JSONを完全に作り直す場合は、次のように`--fresh`を付けて実行します。
 
 ```bash
-python3 build_tapo_osd_glyph_templates.py --fresh --output tapo_osd_glyph_templates.json
+python3 build_tapo_osd_glyph_templates.py --fresh --profile-id tapo_c230_3k --output tapo_osd_glyph_templates.json
 ```
 
 OSDが映っていない、または14桁の日時を切り出せない録画では、テンプレートJSONを作成できず処理を中止します。その場合はOSDが表示されている録画を用意して再実行してください。
 
-設定ファイルに3項目が保存された後は、次回から初期設定を省略して本番の分割処理を開始します。
+設定ファイルに録画フォルダ・出力フォルダ・並列数・Profile定義ファイルが保存された後は、次回から初期設定を省略して本番の分割処理を開始します。
 
-通常利用では設定ファイルを直接編集する必要はありません。録画フォルダ、出力フォルダ、並列処理数を変更する場合は、次のように実行します。
+通常利用では設定ファイルを直接編集する必要はありません。録画フォルダ、出力フォルダ、並列処理数を変更する場合は、次のように実行します。Profileを追加・切り替えする場合だけ、`tapo_profiles.json`の`active`を変更します。
 
 ```bash
 python3 run_tapo_splitter.py --setup

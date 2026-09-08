@@ -2,6 +2,7 @@
 *.json
 !package.json
 !tapo_osd_seed.json
+!tapo_profiles.json
 tapo_training_samples/
 
 # 録画データと分割成果物

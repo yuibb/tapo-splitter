@@ -1,0 +1,30 @@
+{
+  "format": "tapo_splitter_profiles_v1",
+  "default_profile": "tapo_c230_3k",
+  "profiles": [
+    {
+      "id": "tapo_c230_3k",
+      "display_name": "Tapo C230 3K",
+      "active": true,
+      "resolution": {
+        "width": 2880,
+        "height": 1620
+      },
+      "font_file": "tapo_osd_glyph_templates.json",
+      "osd": {
+        "roi": {
+          "x": 0,
+          "y": 0,
+          "width": 950,
+          "height": 70
+        },
+        "slot_ranges": [
+          [7, 43], [50, 88], [99, 137], [148, 185],
+          [247, 282], [290, 330], [391, 426], [435, 475],
+          [530, 565], [579, 617], [675, 710], [724, 765],
+          [819, 854], [867, 905]
+        ]
+      }
+    }
+  ]
+}

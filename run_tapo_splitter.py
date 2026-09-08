@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo OSD Splitter v1.2.0 single entry point."""
+"""Tapo OSD Splitter v1.3.0 single entry point."""
 
 import argparse
 import json
@@ -7,13 +7,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tapo_profile import (
+    ProfileError,
+    load_profiles,
+    resolve_profile,
+    validate_font_profile,
+)
+
 BASE = Path(__file__).resolve().parent
 CONFIG = BASE / "tapo_splitter_config.json"
 SETUP = BASE / "build_tapo_osd_glyph_templates.py"
 PRODUCTION = BASE / "auto_tapo_split.py"
+DEFAULT_PROFILES = BASE / "tapo_profiles.json"
 DEFAULT_RECDATA = BASE.parent / "rec_data"
 DEFAULT_OUTPUT = BASE / "Output"
-DEFAULT_TEMPLATE = BASE / "tapo_osd_glyph_templates.json"
 DEFAULT_WORKERS = 3
 
 
@@ -24,10 +31,11 @@ def resolve(value):
 
 def save_config(data):
     clean = {
-        "version": 1,
+        "version": 2,
         "recdata_dir": str(data["recdata_dir"]),
         "output_dir": str(data["output_dir"]),
         "workers": int(data.get("workers", DEFAULT_WORKERS)),
+        "profiles_file": str(data.get("profiles_file", DEFAULT_PROFILES)),
     }
     CONFIG.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n",
                       encoding="utf-8")
@@ -48,8 +56,10 @@ def load_config():
     workers = data.get("workers", DEFAULT_WORKERS)
     if not isinstance(workers, int) or workers < 1:
         workers = DEFAULT_WORKERS
-    return {"version": 1, "recdata_dir": data["recdata_dir"],
-            "output_dir": data["output_dir"], "workers": workers}
+    profiles_file = data.get("profiles_file", str(DEFAULT_PROFILES))
+    return {"version": 2, "recdata_dir": data["recdata_dir"],
+            "output_dir": data["output_dir"], "workers": workers,
+            "profiles_file": profiles_file}
 
 
 def ask_path(label, default):
@@ -88,6 +98,7 @@ def run_first_setup():
         "recdata_dir": ask_path("録画データフォルダ", DEFAULT_RECDATA),
         "output_dir": ask_path("分割結果の出力フォルダ", DEFAULT_OUTPUT),
         "workers": ask_workers(),
+        "profiles_file": str(DEFAULT_PROFILES),
     }
     return save_config(data)
 
@@ -103,6 +114,40 @@ def run_setup(data):
     saved = save_config(data)
     print("設定を保存しました。")
     return saved
+
+
+def ensure_profile_fonts(recdata, profiles_file):
+    """Build missing Fonts for the Profiles represented by the input videos."""
+    videos = sorted(recdata.glob("*.mp4"))
+    if not videos:
+        raise SystemExit(f"録画データフォルダにMP4がありません: {recdata}")
+
+    checked = set()
+    for video in videos:
+        try:
+            profile = resolve_profile(video, profiles_file, require_font=False)
+        except ProfileError as exc:
+            raise SystemExit(str(exc)) from exc
+        if profile["id"] in checked:
+            continue
+        checked.add(profile["id"])
+        font = Path(profile["font_path"])
+        if not font.is_file():
+            print(f"Profile '{profile['id']}' のFontがないため作成します: {font}")
+            font.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run([
+                sys.executable, str(SETUP), "--input-dir", str(recdata),
+                "--output", str(font), "--profile-id", profile["id"],
+                "--profile-file", str(profiles_file),
+            ], check=True)
+        if not font.is_file():
+            raise SystemExit(f"Profile用Fontが作成されませんでした: {font}")
+        try:
+            embedded = validate_font_profile(font, profile["id"])
+        except ProfileError as exc:
+            raise SystemExit(str(exc)) from exc
+        if embedded is None:
+            print(f"注意: 既存の旧Font JSONです（profile_idなし）: {font}")
 
 
 def main():
@@ -125,20 +170,23 @@ def main():
         raise SystemExit(f"録画データフォルダがありません: {recdata}")
     output.mkdir(parents=True, exist_ok=True)
 
-    if not DEFAULT_TEMPLATE.exists():
-        if not SETUP.exists():
-            raise SystemExit(f"初期設定スクリプトがありません: {SETUP}")
-        print("テンプレートJSONがないため、録画データから作成します。")
-        subprocess.run([sys.executable, str(SETUP), "--input-dir", str(recdata),
-                        "--output", str(DEFAULT_TEMPLATE)], check=True)
-    if not DEFAULT_TEMPLATE.exists():
-        raise SystemExit("テンプレートJSONが作成されなかったため中止しました。")
-
     print(f"録画データ: {recdata}")
     print(f"出力先: {output}")
     print(f"並列処理数: {data['workers']}")
+    profiles_file = resolve(data.get("profiles_file", DEFAULT_PROFILES))
+    try:
+        _registry, _profile_data, profiles = load_profiles(profiles_file)
+    except ProfileError as exc:
+        raise SystemExit(str(exc)) from exc
+    active = [profile["id"] for profile in profiles if profile.get("active")]
+    if not active:
+        raise SystemExit("activeなProfileがありません。tapo_profiles.jsonを確認してください。")
+    print(f"Profile: {', '.join(active)}")
+    if not SETUP.exists():
+        raise SystemExit(f"初期設定スクリプトがありません: {SETUP}")
+    ensure_profile_fonts(recdata, profiles_file)
     subprocess.run([sys.executable, str(PRODUCTION), "--input-dir", str(recdata),
-                    "--output-dir", str(output), "--font", str(DEFAULT_TEMPLATE),
+                    "--output-dir", str(output), "--profiles", str(profiles_file),
                     "--workers", str(data["workers"])], check=True)
 
 

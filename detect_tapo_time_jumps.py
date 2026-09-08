@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from tapo_osd_common import load_templates, save_pair
+from tapo_profile import ProfileError, load_profile_by_id
 from ffmpeg_frame_pipeline import (
     TOLERANCE, coarse_osd_frames, range_frames, probe_duration, record_from_frame,
 )
@@ -56,12 +57,13 @@ def remove_transient_ocr(items, corrections):
     return kept
 
 
-def audit_range(video, templates, lo, hi, step, total, failures, toc, corrections):
+def audit_range(video, templates, lo, hi, step, total, failures, toc, corrections,
+                profile=None):
     items = []
     try:
         for seconds, frame in range_frames(video, lo, hi, step):
             try:
-                item = record_from_frame(seconds, frame, templates)
+                item = record_from_frame(seconds, frame, templates, profile)
                 items.append(item)
                 toc.append({k: v for k, v in item.items() if k not in {"frame", "timestamp"}})
             except Exception as exc:
@@ -84,19 +86,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("video", type=Path)
     parser.add_argument("--font", type=Path, required=True)
+    parser.add_argument("--profile-id", default="unknown")
+    parser.add_argument("--profile-file", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--coarse-step", type=float, default=STEP)
     parser.add_argument("--refine-step", type=float, default=5.0)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    profile = None
+    if args.profile_file and args.profile_id != "unknown":
+        try:
+            profile = load_profile_by_id(args.profile_file, args.profile_id)
+        except ProfileError as exc:
+            raise SystemExit(str(exc)) from exc
     templates = load_templates(args.font)
     total = probe_duration(args.video)
     coarse = []
     failures = []
     ocr_corrections = []
-    for seconds, frame in coarse_osd_frames(args.video, step=args.coarse_step):
+    for seconds, frame in coarse_osd_frames(args.video, step=args.coarse_step,
+                                            profile=profile):
         try:
-            coarse.append(record_from_frame(seconds, frame, templates))
+            coarse.append(record_from_frame(seconds, frame, templates, profile))
         except Exception as exc:
             failures.append({"video_seconds": seconds, "error": str(exc)})
     coarse = remove_transient_ocr(coarse, ocr_corrections)
@@ -117,18 +128,21 @@ def main():
         hi = min(total, after["video_seconds"] + 5.0)
         refined_ranges.append([lo, hi])
         # Pass 2/3/4: only shrink and rescan ranges that remain anomalous.
-        _, pass2 = audit_range(args.video, templates, lo, hi, args.refine_step, total, failures, toc, ocr_corrections)
+        _, pass2 = audit_range(args.video, templates, lo, hi, args.refine_step,
+                               total, failures, toc, ocr_corrections, profile)
         pass3_ranges = [(max(lo, a[0]["video_seconds"] - 2),
                          min(hi, a[1]["video_seconds"] + 2)) for a in pass2]
         pass3 = []
         for a, b in pass3_ranges:
-            _, found = audit_range(args.video, templates, a, b, 2.0, total, failures, toc, ocr_corrections)
+            _, found = audit_range(args.video, templates, a, b, 2.0, total,
+                                   failures, toc, ocr_corrections, profile)
             pass3.extend(found)
         pass4_ranges = [(max(lo, a[0]["video_seconds"] - 1),
                          min(hi, a[1]["video_seconds"] + 1)) for a in pass3]
         final = []
         for a, b in pass4_ranges:
-            _, found = audit_range(args.video, templates, a, b, 1.0, total, failures, toc, ocr_corrections)
+            _, found = audit_range(args.video, templates, a, b, 1.0, total,
+                                   failures, toc, ocr_corrections, profile)
             final.extend(found)
         pending_jump = None
         for left, right, vd, od in final:
@@ -167,7 +181,8 @@ def main():
         for item in toc:
             handle.write(f"{item['video_seconds']:.3f}\t{item['formatted']}\t"
                          f"{item['threshold']}\t{item['margin']}\n")
-    report = {"version": "1.2.0", "engine": "public",
+    report = {"version": "1.3.0", "engine": "public",
+              "profile_id": args.profile_id,
               "video": str(args.video), "font": str(args.font),
               "fastscan_transport": "rawvideo-gray-osd-crop",
               "passes": [f"{args.coarse_step:g}-second OSD rawvideo FastScan",

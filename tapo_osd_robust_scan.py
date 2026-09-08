@@ -35,10 +35,10 @@ def _local_bbox(roi):
     return candidates[0][1:] if candidates else None
 
 
-def extract_glyphs_from_local_contrast(gray):
+def extract_glyphs_from_local_contrast(gray, digit_slots=None):
     """Find digit boxes from local contrast, then extract glyphs from gray."""
     glyphs = []
-    for left, right in DIGIT_SLOTS:
+    for left, right in (digit_slots or DIGIT_SLOTS):
         roi = gray[:, left:right]
         bbox = _local_bbox(roi)
         if bbox is None:
@@ -105,9 +105,9 @@ def _recover_slot(source_gray, detection_gray, left, right):
     return best[1] if best else None
 
 
-def extract_glyphs_from_outline(gray):
+def extract_glyphs_from_outline(gray, digit_slots=None):
     glyphs = []
-    for left, right in DIGIT_SLOTS:
+    for left, right in (digit_slots or DIGIT_SLOTS):
         glyph = _recover_slot(gray, gray, left, right)
         if glyph is None:
             raise RuntimeError("outline fallback could not recover all digit slots")
@@ -115,12 +115,12 @@ def extract_glyphs_from_outline(gray):
     return glyphs
 
 
-def extract_glyphs_from_contrast_outline(gray):
+def extract_glyphs_from_contrast_outline(gray, digit_slots=None):
     """Detect dark outlines in a local-contrast image, crop glyphs from gray."""
     blur = cv2.GaussianBlur(gray, (0, 0), 5)
     contrast = cv2.addWeighted(gray, 1.0, blur, -1.0, 128.0)
     glyphs = []
-    for left, right in DIGIT_SLOTS:
+    for left, right in (digit_slots or DIGIT_SLOTS):
         glyph = _recover_slot(gray, contrast, left, right)
         if glyph is None:
             raise RuntimeError("contrast outline could not recover all digit slots")
@@ -177,10 +177,10 @@ def _recover_slot_luma(source_gray, left, right):
     return best[1] if best else None
 
 
-def extract_glyphs_from_luma_search(gray):
+def extract_glyphs_from_luma_search(gray, digit_slots=None):
     """Use raw-Y outline geometry as a final Fill rescue path."""
     glyphs = []
-    for left, right in DIGIT_SLOTS:
+    for left, right in (digit_slots or DIGIT_SLOTS):
         glyph = _recover_slot_luma(gray, left, right)
         if glyph is None:
             raise RuntimeError("luma search could not recover all digit slots")

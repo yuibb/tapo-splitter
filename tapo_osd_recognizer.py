@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 
+from tapo_profile import geometry_for_profile
+
 
 CANVAS_H, CANVAS_W = 64, 40
 THRESHOLDS = (225, 235, 240, 245, 250)
@@ -25,21 +27,26 @@ def normalize(mask):
     return canvas
 
 
-def components_for_threshold(gray, threshold):
+def components_for_threshold(gray, threshold, profile=None):
     _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    geometry = geometry_for_profile(profile)
+    slots = geometry["slot_ranges"]
+    left_bound = min(left for left, _right in slots)
+    right_bound = max(right for _left, right in slots)
     items = []
     for i in range(1, n):
         x, y, w, h, area = stats[i]
-        if 7 <= x and x + w <= 925 and 35 <= h <= 60 and 5 <= w <= 35 and area >= 120:
+        if left_bound <= x and x + w <= right_bound and 35 <= h <= 60 \
+                and 5 <= w <= 35 and area >= 120:
             items.append((int(x), int(y), int(w), int(h), int(area)))
     return mask, sorted(items)
 
 
-def extract_glyphs_from_gray(gray, source_name="image"):
+def extract_glyphs_from_gray(gray, source_name="image", profile=None):
     candidates = []
     for threshold in THRESHOLDS:
-        mask, comps = components_for_threshold(gray, threshold)
+        mask, comps = components_for_threshold(gray, threshold, profile)
         if len(comps) != 14:
             continue
         heights = np.array([c[3] for c in comps])

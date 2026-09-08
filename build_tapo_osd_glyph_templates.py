@@ -25,6 +25,7 @@ import numpy as np
 
 from tapo_osd_recognizer import recognize
 from tapo_osd_seed import load_seed, recognize_seed
+from tapo_profile import ProfileError, geometry_for_profile, load_profile_by_id
 
 
 BASE = Path(__file__).resolve().parent
@@ -92,8 +93,12 @@ def _appearance_features(gray, components):
     ]
 
 
-def extract_glyphs(gray):
+def extract_glyphs(gray, profile=None):
     """Extract 14 threshold glyphs plus raw geometry metadata."""
+    geometry = geometry_for_profile(profile)
+    slots = geometry["slot_ranges"]
+    left_bound = min(left for left, _right in slots)
+    right_bound = max(right for _left, right in slots)
     candidates = []
     for threshold in THRESHOLDS:
         mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)[1]
@@ -101,7 +106,7 @@ def extract_glyphs(gray):
         comps = []
         for i in range(1, n):
             x, y, w, h, area = map(int, stats[i])
-            if 7 <= x and x + w <= 925 and 35 <= h <= 60 \
+            if left_bound <= x and x + w <= right_bound and 35 <= h <= 60 \
                     and 5 <= w <= 35 and area >= 120:
                 comps.append((x, y, w, h, area))
         if len(comps) == 14:
@@ -112,8 +117,8 @@ def extract_glyphs(gray):
     _, threshold, mask, components = min(candidates, key=lambda item: item[0])
     glyphs, geometry = [], []
     for x, y, w, h, area in components:
-        piece = mask[max(0, y - 2):min(70, y + h + 2),
-                     max(0, x - 2):min(950, x + w + 2)]
+        piece = mask[max(0, y - 2):min(gray.shape[0], y + h + 2),
+                     max(0, x - 2):min(gray.shape[1], x + w + 2)]
         ys, xs = np.where(piece > 0)
         if len(xs) == 0:
             return None
@@ -150,9 +155,9 @@ def _luma_bbox(gray, left, right):
     return min(candidates)[1:] if candidates else None
 
 
-def luma_geometry(gray):
+def luma_geometry(gray, profile=None):
     result = []
-    for left, right in SLOTS:
+    for left, right in geometry_for_profile(profile)["slot_ranges"]:
         bbox = _luma_bbox(gray, left, right)
         if bbox is None:
             return None
@@ -247,12 +252,13 @@ def build_geometry_baseline(frame_records):
 
 
 def write_json(path, labels, candidates, frame_records, target=SELECTED_PER_DIGIT,
-               candidate_minimum=CANDIDATE_MINIMUM, attempts=0):
+               candidate_minimum=CANDIDATE_MINIMUM, attempts=0, profile_id=None):
     selected = {digit: select_elite(candidates[digit], target) for digit in "0123456789"}
     data = {
         "format": "tapo_osd_glyph_templates_v1",
         "builder": "EliteFontBuilder",
-        "builder_version": "1.2.0",
+        "builder_version": "1.3.0",
+        "profile_id": profile_id,
         "label_source": "user-confirmed OSD strings from recordings",
         "label_assistant": "tapo_osd_seed.json for provisional labels; user confirmation for ambiguous frames",
         "candidate_minimum_per_digit": candidate_minimum,
@@ -363,7 +369,19 @@ def main():
                         help="Seedの仮ラベルを自動採用する最小margin（default: 0.08）")
     parser.add_argument("--no-seed", action="store_true",
                         help="Seed Dataによる仮ラベル提案を無効にする")
+    parser.add_argument("--profile-id",
+                        help="生成するFontを紐づけるProfile ID")
+    parser.add_argument("--profile-file", type=Path,
+                        default=BASE / "tapo_profiles.json",
+                        help="Profile定義JSON")
     args = parser.parse_args()
+    profile = None
+    if args.profile_id:
+        try:
+            profile = load_profile_by_id(args.profile_file, args.profile_id,
+                                         require_font=False)
+        except ProfileError as exc:
+            raise SystemExit(str(exc)) from exc
     if args.candidate_minimum < args.selected_per_digit or args.selected_per_digit < 1:
         raise SystemExit("candidate-minimumはselected-per-digit以上にしてください")
     rng = random.Random(args.seed)
@@ -403,7 +421,8 @@ def main():
         counts = {digit: len(candidates[digit]) for digit in "0123456789"}
         if all(counts[digit] >= args.candidate_minimum for digit in "0123456789"):
             write_json(args.output, labels, candidates, frame_records,
-                       args.selected_per_digit, args.candidate_minimum, attempts)
+                       args.selected_per_digit, args.candidate_minimum, attempts,
+                       args.profile_id)
             print(f"完成: {args.output}")
             print("候補数:", counts)
             print("最終Elite数:", {digit: args.selected_per_digit for digit in "0123456789"})
@@ -427,9 +446,12 @@ def main():
             frame, seconds = choose_video_frame(video, rng.uniform(0, max(0.1, duration - 0.1)))
             if frame is None:
                 continue
-            strip = frame[:70, :950]
+            geometry = geometry_for_profile(profile)
+            roi = geometry["roi"]
+            strip = frame[roi["y"]:roi["y"] + roi["height"],
+                          roi["x"]:roi["x"] + roi["width"]]
             gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-            result = extract_glyphs(gray)
+            result = extract_glyphs(gray, profile)
             if result is None:
                 continue
 
@@ -455,7 +477,8 @@ def main():
                 answer = input("OSD正解文字列 (YYYYMMDDHHMMSS / Enter=skip / q=abort): ").strip()
             if answer.lower() == "q":
                 write_json(args.output, labels, candidates, frame_records,
-                           args.selected_per_digit, args.candidate_minimum, attempts)
+                           args.selected_per_digit, args.candidate_minimum, attempts,
+                           args.profile_id)
                 raise SystemExit("ユーザー指定でabortしました。途中候補を保存しました。")
             if not valid_label(answer):
                 continue
@@ -463,7 +486,7 @@ def main():
             key = label_path.name
             labels[key] = {"osd": answer, "video": str(video), "seconds": seconds,
                            "threshold": result["threshold"]}
-            gray_geometry = luma_geometry(gray)
+            gray_geometry = luma_geometry(gray, profile)
             frame_records.append({
                 "source": key, "video": video.name, "seconds": seconds,
                 "threshold_geometry": result["components"],
@@ -497,11 +520,13 @@ def main():
                 last_times[(video.name, digit)].append(seconds)
                 added_digits.add(digit)
             write_json(args.output, labels, candidates, frame_records,
-                       args.selected_per_digit, args.candidate_minimum, attempts)
+                       args.selected_per_digit, args.candidate_minimum, attempts,
+                       args.profile_id)
             print("候補数:", {digit: len(candidates[digit]) for digit in "0123456789"})
 
     write_json(args.output, labels, candidates, frame_records,
-               args.selected_per_digit, args.candidate_minimum, attempts)
+               args.selected_per_digit, args.candidate_minimum, attempts,
+               args.profile_id)
     counts = {digit: len(candidates[digit]) for digit in "0123456789"}
     raise SystemExit(f"候補収集を終了しました。max-attempts到達: {counts}")
 

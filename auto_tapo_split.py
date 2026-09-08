@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo production splitter using Ver 1.2.0 (15→5→2→1 range-pipe) detection.
+"""Tapo production splitter using Ver 1.3.0 (15→5→2→1 range-pipe) detection.
 
 Example:
   .tapo-venv/bin/python auto_tapo_split.py \
@@ -23,11 +23,12 @@ from threading import Lock
 
 from ffmpeg_frame_pipeline import osd_range_frames, range_frames, record_from_frame
 from tapo_osd_common import load_templates
+from tapo_profile import ProfileError, resolve_profile
 
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.2.0"
+SPLITTER_VERSION = "1.3.0"
 NAME_LOCK = Lock()
 
 
@@ -99,7 +100,8 @@ def make_error_intervals(report, samples, duration):
     return merged
 
 
-def rescan_error_intervals(video, report, samples, duration, templates, step=1.0):
+def rescan_error_intervals(video, report, samples, duration, templates, step=1.0,
+                           profile=None):
     """Rescan each coarse error interval and keep only still-unknown spans."""
     broad = make_error_intervals(report, samples, duration)
     recovered = []
@@ -110,7 +112,7 @@ def rescan_error_intervals(video, report, samples, duration, templates, step=1.0
         for seconds, frame in range_frames(
                 video, interval["start"], interval["end"], step):
             try:
-                points.append(record_from_frame(seconds, frame, templates))
+                points.append(record_from_frame(seconds, frame, templates, profile))
             except Exception:
                 points.append({"video_seconds": seconds, "error": True})
         previous = None
@@ -170,12 +172,12 @@ def _transition_cost(left, right):
     return 3.0 + min(drift / 60.0, 20.0) * 0.1
 
 
-def _decode_multiframe_candidates(frames, center, templates):
+def _decode_multiframe_candidates(frames, center, templates, profile=None):
     """Build candidates from several aligned frames and their composites."""
     observations = []
     for seconds, frame in frames:
         try:
-            observations.append(record_from_frame(seconds, frame, templates))
+            observations.append(record_from_frame(seconds, frame, templates, profile))
         except Exception:
             pass
     def collect(groups):
@@ -211,7 +213,7 @@ def _decode_multiframe_candidates(frames, center, templates):
         for method, gray in composites:
             try:
                 frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                item = record_from_frame(center, frame, templates)
+                item = record_from_frame(center, frame, templates, profile)
                 item["scan_method"] = f"multiframe_{method}"
                 observations.append(item)
             except Exception:
@@ -284,8 +286,9 @@ def _merge_intervals(intervals):
     return merged
 
 
-def _rescan_multiframe_interval(video, interval, samples, templates):
-    scan_frames = list(osd_range_frames(video, interval["start"], interval["end"], 0.5))
+def _rescan_multiframe_interval(video, interval, samples, templates, profile=None):
+    scan_frames = list(osd_range_frames(
+        video, interval["start"], interval["end"], 0.5, profile))
     buckets = {}
     for seconds, frame in scan_frames:
         bucket = round(seconds - interval["start"])
@@ -298,7 +301,7 @@ def _rescan_multiframe_interval(video, interval, samples, templates):
         center = min(interval["end"], interval["start"] + bucket)
         centers.append(center)
         candidate_sets.append(_decode_multiframe_candidates(
-            buckets.get(bucket, []), center, templates))
+            buckets.get(bucket, []), center, templates, profile))
     before = max((item for item in samples if item[0] < interval["start"]),
                  key=lambda item: item[0], default=None)
     after = min((item for item in samples if item[0] > interval["end"]),
@@ -340,13 +343,14 @@ def _rescan_multiframe_interval(video, interval, samples, templates):
     return recovered, remaining, recovered_jumps
 
 
-def rescan_error_intervals_multiframe(video, report, samples, duration, templates):
+def rescan_error_intervals_multiframe(video, report, samples, duration, templates,
+                                      profile=None):
     """Recover error spans using multi-frame consensus and decoding."""
     broad = make_error_intervals(report, samples, duration)
     recovered, remaining, recovered_jumps = [], [], []
     for interval in broad:
         part_recovered, part_remaining, part_jumps = _rescan_multiframe_interval(
-            video, interval, samples, templates)
+            video, interval, samples, templates, profile)
         recovered.extend(part_recovered)
         remaining.extend(part_remaining)
         recovered_jumps.extend(part_jumps)
@@ -424,16 +428,27 @@ def unique_path(path):
         raise RuntimeError(f"too many filename collisions: {path}")
 
 
-def process_video(video, output_root, python_executable, font):
-    print(f"processing: {video.name}", flush=True)
+def process_video(video, output_root, python_executable, profiles_file, legacy_font=None):
+    try:
+        profile = resolve_profile(video, profiles_file) if profiles_file else None
+    except ProfileError:
+        if profiles_file is not None or legacy_font is None:
+            raise
+        profile = {"id": "legacy-font", "font_path": str(legacy_font),
+                   "video_resolution": {"width": None, "height": None}}
+    font = Path(profile["font_path"])
+    print(f"processing: {video.name} [Profile: {profile['id']}]", flush=True)
     work = output_root / f".work_{video.stem}"
     work.mkdir(parents=True, exist_ok=True)
     report_dir = work / "jump_report"
     run([python_executable, str(DETECTOR), str(video), "--font", str(font),
+         "--profile-id", profile["id"],
+         "--profile-file", profile["registry_path"],
          "--output", str(report_dir), "--coarse-step", "15",
          "--refine-step", "5"])
 
     report = json.loads((report_dir / "time_jump_report.json").read_text(encoding="utf-8"))
+    report["profile_id"] = profile["id"]
     samples = read_samples(report_dir / "toc_samples.tsv")
     source_duration = probe_duration(video)
     if len(samples) < 2:
@@ -441,6 +456,7 @@ def process_video(video, output_root, python_executable, font):
         index_path.write_text(
             f"# {video.name}\n\n"
             f"- 使用スプリッター: `{SPLITTER_VERSION}`\n"
+            f"- 使用Profile: `{profile['id']}`\n"
             f"- 判定: **分割スキップ**\n"
             f"- 理由: 正常に認識できたOSDサンプルが2点未満（{len(samples)}点）\n"
             f"- 元ファイル時間: `{source_duration:.3f} 秒`\n"
@@ -452,7 +468,7 @@ def process_video(video, output_root, python_executable, font):
         return
     templates = load_templates(font)
     recovered, error_intervals, recovered_jumps = rescan_error_intervals_multiframe(
-        video, report, samples, source_duration, templates)
+        video, report, samples, source_duration, templates, profile)
     samples.extend((item["video_seconds"], item["timestamp"]) for item in recovered)
     report["jumps"].extend(recovered_jumps)
     segments = make_segments(report, samples, source_duration, error_intervals)
@@ -492,6 +508,7 @@ def process_video(video, output_root, python_executable, font):
     lines = [
         f"# {video.name}", "", "無劣化ストリームコピー（H.264/音声 → MOV）による分割一覧。", "",
         f"- 使用スプリッター: `{SPLITTER_VERSION}`（15→5→2→1秒のrange-pipe方式）",
+        f"- 使用Profile: `{profile['id']}`",
         f"- 元ファイル時間: `{source_duration:.3f} 秒`",
         f"- 分割後合計時間: `{output_total:.3f} 秒`",
         f"- 差分（分割後−元）: `{delta:+.3f} 秒`",
@@ -535,6 +552,8 @@ def main():
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--font", type=Path, default=FONT)
+    parser.add_argument("--profiles", type=Path,
+                        help="解像度ごとのProfile＋EliteFont定義JSON")
     parser.add_argument("--workers", type=int, default=3,
                         help="number of videos to process in parallel (default: 3)")
     parser.add_argument("--reprocess-existing", action="store_true",
@@ -557,7 +576,7 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(process_video, video, args.output_dir,
-                        python_executable, args.font): video
+                        python_executable, args.profiles, args.font): video
             for video in videos
         }
         for future in as_completed(futures):

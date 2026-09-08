@@ -19,6 +19,7 @@ from tapo_osd_common import (
     save_pair,
     detect_osd_stalls,
 )
+from tapo_profile import geometry_for_profile
 BASE = Path(__file__).resolve().parent
 FONT_PATH = BASE / "tapo_osd_glyph_templates.json"
 
@@ -72,19 +73,21 @@ def coarse_frames(video, step=STEP):
             yield seconds, image
 
 
-def coarse_osd_frames(video, step=STEP):
+def coarse_osd_frames(video, step=STEP, profile=None):
     """Read only the OSD crop as lossless grayscale rawvideo for FastScan."""
+    geometry = geometry_for_profile(profile)
+    roi = geometry["roi"]
     command = ffmpeg_command(
         "-v", "info", "-copyts", "-i", str(video), "-an", "-sn",
         "-vf", (
-            f"crop={OSD_WIDTH}:{OSD_HEIGHT}:0:0,format=gray,"
+            f"crop={roi['width']}:{roi['height']}:{roi['x']}:{roi['y']},format=gray,"
             f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{step})',showinfo"
         ),
         "-fps_mode", "vfr", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
     )
     result = subprocess.run(command, check=True, capture_output=True)
     pts = [float(x) for x in re.findall(rb"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr)]
-    frame_size = OSD_WIDTH * OSD_HEIGHT
+    frame_size = roi["width"] * roi["height"]
     if len(result.stdout) != len(pts) * frame_size:
         raise RuntimeError(
             f"coarse OSD pipe size mismatch: pts={len(pts)} "
@@ -94,7 +97,7 @@ def coarse_osd_frames(video, step=STEP):
         offset = index * frame_size
         yield seconds, np.frombuffer(
             result.stdout[offset:offset + frame_size], dtype=np.uint8
-        ).reshape((OSD_HEIGHT, OSD_WIDTH))
+        ).reshape((roi["height"], roi["width"]))
 
 
 def range_frames(video, start, end, step):
@@ -116,34 +119,37 @@ def range_frames(video, start, end, step):
             yield seconds, image
 
 
-def osd_range_frames(video, start, end, step):
+def osd_range_frames(video, start, end, step, profile=None):
     """Read only the fixed OSD crop for recognition-only rescans."""
+    geometry = geometry_for_profile(profile)
+    roi = geometry["roi"]
     command = ffmpeg_command(
         "-v", "info", "-copyts", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
         "-i", str(video), "-an", "-sn",
-        "-vf", f"crop=950:70:0:0,format=gray,select='isnan(prev_selected_t)+gte(t-prev_selected_t,{step})',showinfo",
+        "-vf", (f"crop={roi['width']}:{roi['height']}:{roi['x']}:{roi['y']},"
+                f"format=gray,select='isnan(prev_selected_t)+gte(t-prev_selected_t,{step})',showinfo"),
         "-fps_mode", "vfr", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
     )
     result = subprocess.run(command, check=True, capture_output=True)
     pts = [float(x) for x in re.findall(rb"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr)]
-    frame_size = 950 * 70
+    frame_size = roi["width"] * roi["height"]
     if len(result.stdout) != len(pts) * frame_size:
         raise RuntimeError(f"OSD range pipe size mismatch: pts={len(pts)} bytes={len(result.stdout)}")
     for index, seconds in enumerate(pts):
         gray = np.frombuffer(result.stdout[index * frame_size:(index + 1) * frame_size],
-                             dtype=np.uint8).reshape((70, 950))
+                             dtype=np.uint8).reshape((roi["height"], roi["width"]))
         yield seconds, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-def record_from_frame(seconds, frame, templates):
-    timestamp, value, threshold, margin = recognize_osd(frame, templates)
+def record_from_frame(seconds, frame, templates, profile=None):
+    timestamp, value, threshold, margin = recognize_osd(frame, templates, profile)
     return {"video_seconds": seconds, "osd_digits": value,
             "formatted": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "threshold": threshold, "margin": margin,
             "frame": frame, "timestamp": timestamp}
 
 
-def seek_record(video, seconds, templates):
+def seek_record(video, seconds, templates, profile=None):
     command = ffmpeg_command("-v", "info", "-copyts", "-ss", f"{seconds:.3f}", "-i", str(video),
                "-vf", "showinfo", "-frames:v", "1", "-f", "image2pipe",
                "-vcodec", "mjpeg", "pipe:1")
@@ -153,7 +159,7 @@ def seek_record(video, seconds, templates):
     if not match or image is None:
         raise RuntimeError(f"could not obtain PTS/frame at {seconds:.3f}s")
     frame = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
-    return record_from_frame(float(match.group(1)), frame, templates)
+    return record_from_frame(float(match.group(1)), frame, templates, profile)
 
 
 def main():

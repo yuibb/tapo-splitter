@@ -13,6 +13,7 @@ from tapo_osd_robust_scan import (
     extract_glyphs_from_outline,
 )
 from tapo_osd_recognizer import extract_glyphs_from_gray, recognize
+from tapo_profile import geometry_for_profile
 
 OSD_WIDTH, OSD_HEIGHT = 950, 70
 MIN_MARGIN = 80
@@ -39,21 +40,30 @@ def _recognize_glyphs(glyphs, templates, minimum_margin):
     return timestamp, value, min(margins)
 
 
-def recognize_osd(frame, templates):
-    roi = frame[:OSD_HEIGHT, :OSD_WIDTH]
+def recognize_osd(frame, templates, profile=None):
+    geometry = geometry_for_profile(profile)
+    roi_spec = geometry["roi"]
+    if frame.shape[0] == roi_spec["height"] and frame.shape[1] == roi_spec["width"]:
+        roi = frame
+    else:
+        roi = frame[roi_spec["y"]:roi_spec["y"] + roi_spec["height"],
+                    roi_spec["x"]:roi_spec["x"] + roi_spec["width"]]
+    if roi.shape[:2] != (roi_spec["height"], roi_spec["width"]):
+        raise RuntimeError("ProfileのOSD ROIが動画フレーム範囲外です")
     # FastScan supplies the already-cropped grayscale rawvideo directly.
     # Keep accepting BGR frames for refinement and evidence paths.
     gray = roi if roi.ndim == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     try:
-        glyphs, threshold = extract_glyphs_from_gray(gray, "video frame")
+        glyphs, threshold = extract_glyphs_from_gray(gray, "video frame", profile)
         timestamp, value, margin = _recognize_glyphs(glyphs, templates, MIN_MARGIN)
         return timestamp, value, threshold, margin
     except Exception as primary_error:
+        slots = geometry["slot_ranges"]
         for method, extractor in (("raw_outline", extract_glyphs_from_outline),
                                   ("contrast_outline", extract_glyphs_from_contrast_outline),
                                   ("luma_search", extract_glyphs_from_luma_search)):
             try:
-                glyphs = extractor(gray)
+                glyphs = extractor(gray, slots)
                 timestamp, value, margin = _recognize_glyphs(
                     glyphs, templates, ROBUST_MIN_MARGIN)
                 return timestamp, value, method, margin
