@@ -38,6 +38,8 @@ YYYYMMDD_HHMMSS_動画長さ.mov
 本プロジェクトのテスト環境で、Tapo録画MP4に対するOSD認識・時刻ジャンプ検出・GOP単位分割を確認済みです。
 
 - macOS
+- Tapo C230
+- 録画解像度 2880×1620
 - Python 3.10以上
 - ffmpeg / ffprobe
 - OpenCV（ヘッドレス版）
@@ -70,6 +72,8 @@ winget install --id Gyan.FFmpeg.Shared -e
 ```
 
 インストール後、新しいターミナルを開いて`ffmpeg`と`ffprobe`が実行できることを確認してください。
+
+Pythonや依存ライブラリの導入に慣れていない場合は、READMEをCodexなどのAIコーディング支援へ渡し、環境確認とインストール手順を案内してもらう方法をおすすめします。
 
 ## 使い方
 
