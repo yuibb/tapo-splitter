@@ -31,6 +31,7 @@ YYYYMMDD_HHMMSS_動画長さ.mov
 - **v1.1.0**: OSD認識に失敗した場合のアウトライン補助、数字ごとに20枚のテンプレートを収集する仕組み、設定変更モードを追加
 - **v1.2.0**: Fill Scan / Robust Scanの役割を整理し、初回Builder向けの粗いSeed補助、Geometry Baseline、Width Profileの審判情報、候補35枚から多様性を考慮してElite20を選ぶ仕組みを追加
 - **v1.3.0**: 解像度ごとのProfile＋EliteFontセット、active Profile選択、Profileと動画解像度の不一致時に誤認識せず停止する仕組みを追加
+- **v1.3.1**: Hamming比較をNumPyベクトル化し、認識結果を変えずに認識処理を高速化
 
 ## 必要環境
 

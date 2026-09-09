@@ -82,11 +82,60 @@ def shifted_hamming(a, b):
     return best
 
 
+_TEMPLATE_CACHE = {}
+
+
+def _shifted_variants(glyph):
+    """Build the nine ±1-pixel variants once for one glyph."""
+    variants = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            shifted = np.zeros_like(glyph)
+            y0, y1 = max(0, dy), min(CANVAS_H, CANVAS_H + dy)
+            x0, x1 = max(0, dx), min(CANVAS_W, CANVAS_W + dx)
+            shifted[y0:y1, x0:x1] = glyph[y0 - dy:y1 - dy, x0 - dx:x1 - dx]
+            variants.append(shifted)
+    return np.stack(variants)
+
+
+def _prepared_templates(templates):
+    """Cache stacked templates while keeping legacy dict input compatible."""
+    key = id(templates)
+    cached = _TEMPLATE_CACHE.get(key)
+    if cached is not None and cached[0] is templates:
+        return cached[1:]
+
+    digits = tuple(sorted(templates))
+    stacks = tuple(np.stack(templates[digit]) for digit in digits)
+    counts = tuple(len(stack) for stack in stacks)
+    equal_counts = len(set(counts)) == 1
+    bank = np.stack(stacks) if equal_counts else None
+    prepared = (templates, digits, stacks, bank)
+    _TEMPLATE_CACHE[key] = prepared
+    return prepared[1:]
+
+
 def recognize(glyph, templates):
-    scores = []
-    for digit, values in templates.items():
-        distances = sorted(shifted_hamming(glyph, t) for t in values)
-        scores.append((distances[0], digit))
+    digits, stacks, bank = _prepared_templates(templates)
+    shifted = _shifted_variants(glyph)
+
+    if bank is not None:
+        # Shape: shifts × digits × templates × pixels.
+        distances = np.count_nonzero(
+            shifted[:, None, None, :, :] != bank[None, :, :, :, :],
+            axis=(3, 4),
+        )
+        best_by_digit = distances.min(axis=(0, 2))
+        scores = [(int(best), digit) for best, digit in zip(best_by_digit, digits)]
+    else:
+        # Keep compatibility with legacy JSON files with uneven template counts.
+        scores = []
+        for digit, stack in zip(digits, stacks):
+            distances = np.count_nonzero(
+                shifted[:, None, :, :] != stack[None, :, :, :],
+                axis=(2, 3),
+            )
+            scores.append((int(distances.min()), digit))
     scores.sort()
     best, digit = scores[0]
     margin = scores[1][0] - best if len(scores) > 1 else None
