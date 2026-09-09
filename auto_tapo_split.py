@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo production splitter using Ver 1.3.0 (15→5→2→1 range-pipe) detection.
+"""Tapo production splitter using v1.3.2 Fast/Full Lane detection.
 
 Example:
   .tapo-venv/bin/python auto_tapo_split.py \
@@ -21,14 +21,20 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
-from ffmpeg_frame_pipeline import osd_range_frames, range_frames, record_from_frame
-from tapo_osd_common import load_templates
+from ffmpeg_frame_pipeline import (
+    osd_range_frames, range_frames, record_from_frame, state_from_frame,
+)
+from tapo_osd_common import ERROR, SUSPECT, UNKNOWN, VALID, load_templates
 from tapo_profile import ProfileError, resolve_profile
 
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.3.0"
+SPLITTER_VERSION = "1.3.2"
+FULL_LANE_PADDING_SECONDS = 3.0
+FULL_LANE_STEP_SECONDS = 1.0
+FULL_LANE_DRIFT_TOLERANCE = 3.0
+FULL_LANE_MAX_BRIDGE_GAP_SECONDS = 120.0
 NAME_LOCK = Lock()
 
 
@@ -67,9 +73,12 @@ def nearest_osd(samples, seconds):
 
 
 def make_error_intervals(report, samples, duration):
-    """Group recognition failures and bound them by neighboring successes."""
+    """Group non-VALID observations and bound them by neighboring VALID ones."""
+    observations = report.get("non_valid_observations",
+                              report.get("recognition_failures", []))
     failed = sorted(float(item["video_seconds"])
-                    for item in report.get("recognition_failures", []))
+                    for item in observations
+                    if item.get("status") in {SUSPECT, UNKNOWN, ERROR})
     if not failed or not samples:
         return []
     groups, current = [], []
@@ -90,7 +99,7 @@ def make_error_intervals(report, samples, duration):
         if end > start:
             intervals.append({"start": max(0.0, start),
                               "end": min(duration, end),
-                              "reason": "OSD認識失敗区間"})
+                              "reason": "OSD要調査区間"})
     merged = []
     for interval in sorted(intervals, key=lambda item: item["start"]):
         if merged and interval["start"] <= merged[-1]["end"] + 1.0:
@@ -357,6 +366,262 @@ def rescan_error_intervals_multiframe(video, report, samples, duration, template
     return recovered, _merge_intervals(remaining), recovered_jumps
 
 
+def _full_lane_boundary_samples(interval, samples):
+    """Return the nearest known-good samples around an unresolved interval."""
+    before = max((item for item in samples if item[0] < interval["start"]),
+                 key=lambda item: item[0], default=None)
+    after = min((item for item in samples if item[0] > interval["end"]),
+                key=lambda item: item[0], default=None)
+    return before, after
+
+
+def _remove_transient_full_lane_ocr(items, before=None, after=None):
+    """Remove an isolated wild date read when its neighbors connect normally."""
+    context = list(items)
+    original_ids = {id(item) for item in items}
+    for boundary, side in ((before, "before"), (after, "after")):
+        if boundary is None:
+            continue
+        sample = {
+            "video_seconds": boundary[0],
+            "timestamp": boundary[1],
+            "osd_digits": boundary[1].strftime("%Y%m%d%H%M%S"),
+            "formatted": boundary[1].strftime("%Y-%m-%d %H:%M:%S"),
+            "margin": None,
+            "_boundary": side,
+        }
+        context.append(sample)
+    context.sort(key=lambda item: item["video_seconds"])
+    transient_ids = set()
+    for left_index, left in enumerate(context):
+        for right_index in range(left_index + 2,
+                                 min(len(context), left_index + 5)):
+            right = context[right_index]
+            video_span = right["video_seconds"] - left["video_seconds"]
+            osd_span = (right["timestamp"] - left["timestamp"]).total_seconds()
+            if (video_span <= 0
+                    or abs(osd_span - video_span) > FULL_LANE_DRIFT_TOLERANCE):
+                continue
+            middle = context[left_index + 1:right_index]
+            if any(abs((item["timestamp"] - left["timestamp"]).total_seconds()
+                       - (item["video_seconds"] - left["video_seconds"])) > 60.0
+                   for item in middle):
+                transient_ids.update(id(item) for item in middle)
+    return [item for item in items
+            if id(item) not in transient_ids and id(item) in original_ids]
+
+
+def _full_lane_transitions(records, before, after):
+    """Find jumps/stalls in a single Full Lane pipe window.
+
+    The recognizer remains the same recognizer.  Full Lane only widens the
+    evidence window and lowers the rescue margin to 70; it never changes a
+    digit based on geometry or width alone.
+    """
+    records = _remove_transient_full_lane_ocr(records, before, after)
+    context = []
+    if before is not None:
+        context.append({"video_seconds": before[0], "timestamp": before[1],
+                        "osd_digits": before[1].strftime("%Y%m%d%H%M%S"),
+                        "formatted": before[1].strftime("%Y-%m-%d %H:%M:%S"),
+                        "margin": None})
+    context.extend(records)
+    if after is not None:
+        context.append({"video_seconds": after[0], "timestamp": after[1],
+                        "osd_digits": after[1].strftime("%Y%m%d%H%M%S"),
+                        "formatted": after[1].strftime("%Y-%m-%d %H:%M:%S"),
+                        "margin": None})
+    context.sort(key=lambda item: item["video_seconds"])
+    deduped = []
+    for item in context:
+        if deduped and abs(item["video_seconds"] -
+                           deduped[-1]["video_seconds"]) < 0.25:
+            current = deduped[-1]
+            if (item.get("margin") or -1) > (current.get("margin") or -1):
+                deduped[-1] = item
+            continue
+        deduped.append(item)
+
+    jumps, stalls = [], []
+    stall_start = None
+    stall_reported = False
+    for left, right in zip(deduped, deduped[1:]):
+        video_delta = right["video_seconds"] - left["video_seconds"]
+        if video_delta <= 0:
+            stall_start = None
+            stall_reported = False
+            continue
+        osd_delta = (right["timestamp"] - left["timestamp"]).total_seconds()
+        drift = osd_delta - video_delta
+        if video_delta > FULL_LANE_STEP_SECONDS * 4.0:
+            stall_start = None
+            stall_reported = False
+            # A long unreadable span can hide the exact jump frame.  Keep the
+            # boundary mismatch as a bridge candidate; make_segments will
+            # still keep it inside the unresolved Err interval.
+            if (video_delta <= FULL_LANE_MAX_BRIDGE_GAP_SECONDS
+                    and left["osd_digits"] != right["osd_digits"]
+                    and abs(drift) > FULL_LANE_DRIFT_TOLERANCE):
+                jumps.append({
+                    "before_video_seconds": left["video_seconds"],
+                    "after_video_seconds": right["video_seconds"],
+                    "before_osd": left["formatted"],
+                    "after_osd": right["formatted"],
+                    "video_elapsed_seconds": video_delta,
+                    "osd_elapsed_seconds": osd_delta,
+                    "jump_seconds": drift,
+                    "scan_method": "full_lane_bridge",
+                })
+            continue
+        if left["osd_digits"] == right["osd_digits"]:
+            if video_delta <= FULL_LANE_STEP_SECONDS * 2.5:
+                if stall_start is None:
+                    stall_start = left
+                    stall_reported = False
+                if (not stall_reported and
+                        right["video_seconds"] - stall_start["video_seconds"] >= 5.0):
+                    stalls.append({
+                        "video_start_seconds": stall_start["video_seconds"],
+                        "video_end_seconds": right["video_seconds"],
+                        "duration_seconds": (
+                            right["video_seconds"] - stall_start["video_seconds"]),
+                        "osd": stall_start["formatted"],
+                    })
+                    stall_reported = True
+            else:
+                stall_start = None
+                stall_reported = False
+            continue
+        stall_start = None
+        stall_reported = False
+        if abs(drift) > FULL_LANE_DRIFT_TOLERANCE:
+            jumps.append({
+                "before_video_seconds": left["video_seconds"],
+                "after_video_seconds": right["video_seconds"],
+                "before_osd": left["formatted"],
+                "after_osd": right["formatted"],
+                "video_elapsed_seconds": video_delta,
+                "osd_elapsed_seconds": osd_delta,
+                "jump_seconds": drift,
+                "scan_method": "full_lane",
+            })
+    return jumps, stalls
+
+
+def _full_lane_remaining(interval, failed_times, recovered):
+    """Keep only the portions that still have no readable Full Lane sample."""
+    failed_times = sorted(
+        value for value in failed_times
+        if interval["start"] <= value <= interval["end"]
+    )
+    if not failed_times:
+        return []
+    groups = _group_close(failed_times, FULL_LANE_STEP_SECONDS * 1.5)
+    good_times = sorted(item["video_seconds"] for item in recovered
+                        if interval["start"] <= item["video_seconds"] <= interval["end"])
+    remaining = []
+    for group in groups:
+        before = [value for value in good_times if value < group[0]]
+        after = [value for value in good_times if value > group[-1]]
+        start = (before[-1] + group[0]) / 2 if before else interval["start"]
+        end = (group[-1] + after[0]) / 2 if after else interval["end"]
+        if end > start:
+            remaining.append({"start": max(interval["start"], start),
+                              "end": min(interval["end"], end),
+                              "reason": "Full LaneでもOSD認識不能"})
+    return remaining
+
+
+def rescan_error_intervals_full_lane(video, report, samples, duration, templates,
+                                     profile=None):
+    """Investigate only non-VALID spans without treating them as fatal errors.
+
+    Full Lane first asks whether the surrounding VALID OSD observations follow
+    normal PTS time.  A continuous gap is harmless even when individual
+    frames are SUSPECT or UNKNOWN.  Only a temporal anomaly remains an Err
+    span unless Full Lane obtains sufficiently strong direct evidence.
+    """
+    broad = make_error_intervals(report, samples, duration)
+    recovered, remaining, rescued_jumps, rescued_stalls = [], [], [], []
+    stats = {
+        "intervals": len(broad),
+        "pipe_windows": 0,
+        "pipe_frames": 0,
+        "valid_frames": 0,
+        "suspect_frames": 0,
+        "unknown_frames": 0,
+        "error_frames": 0,
+        "continuous_gaps": 0,
+        "temporal_anomalies": 0,
+        "rescued_jumps": 0,
+        "unresolved_intervals": 0,
+    }
+    for interval in broad:
+        scan_start = max(0.0, interval["start"] - FULL_LANE_PADDING_SECONDS)
+        scan_end = min(duration, interval["end"] + FULL_LANE_PADDING_SECONDS)
+        before, after = _full_lane_boundary_samples(interval, samples)
+        valid_observations = []
+        stats["pipe_windows"] += 1
+        try:
+            frames = list(osd_range_frames(
+                video, scan_start, scan_end, FULL_LANE_STEP_SECONDS, profile))
+        except Exception:
+            frames = []
+        stats["pipe_frames"] += len(frames)
+        for seconds, frame in frames:
+            try:
+                state = state_from_frame(seconds, frame, templates, profile)
+            except Exception:
+                stats["error_frames"] += 1
+                continue
+            if state["status"] == VALID:
+                valid_observations.append(state)
+            elif state["status"] == SUSPECT:
+                stats["suspect_frames"] += 1
+            elif state["status"] == UNKNOWN:
+                stats["unknown_frames"] += 1
+            else:
+                stats["error_frames"] += 1
+        valid_observations = _remove_transient_full_lane_ocr(
+            valid_observations, before, after)
+        recovered.extend(
+            item for item in valid_observations
+            if interval["start"] <= item["video_seconds"] <= interval["end"]
+        )
+        stats["valid_frames"] += len(valid_observations)
+
+        boundary_drift = None
+        if before is not None and after is not None:
+            boundary_drift = ((after[1] - before[1]).total_seconds()
+                              - (after[0] - before[0]))
+        if boundary_drift is not None and abs(boundary_drift) <= FULL_LANE_DRIFT_TOLERANCE:
+            # UNKNOWN/SUSPECT frames are a hole in an otherwise continuous
+            # timeline, not a video error and not a splitting boundary.
+            stats["continuous_gaps"] += 1
+            continue
+
+        stats["temporal_anomalies"] += 1
+        jumps, stalls = _full_lane_transitions(valid_observations, before, after)
+        rescued_jumps.extend(jumps)
+        rescued_stalls.extend(stalls)
+        # An anomalous span remains explicitly marked until a later Rescue
+        # Gate can prove every weak frame.  A direct bridge is recorded above,
+        # but never promoted solely because its margin happened to be low.
+        remaining.append({"start": interval["start"], "end": interval["end"],
+                          "reason": "時系列異常を伴うOSD要調査区間"})
+        stats["unresolved_intervals"] += 1
+
+    unique_jumps = []
+    for jump in sorted(rescued_jumps, key=lambda item: item["before_video_seconds"]):
+        if any(abs(jump["before_video_seconds"] - existing["before_video_seconds"]) < 3.0
+               for existing in unique_jumps):
+            continue
+        unique_jumps.append(jump)
+    stats["rescued_jumps"] = len(unique_jumps)
+    return (recovered, _merge_intervals(remaining), unique_jumps,
+            rescued_stalls, stats)
+
+
 def make_segments(report, samples, duration, error_intervals=None):
     error_intervals = error_intervals or []
     jump_pairs = []
@@ -467,10 +732,28 @@ def process_video(video, output_root, python_executable, profiles_file, legacy_f
         print(f"skipped: {video.name} (fewer than 2 valid OSD samples)", flush=True)
         return
     templates = load_templates(font)
-    recovered, error_intervals, recovered_jumps = rescan_error_intervals_multiframe(
+    (recovered, error_intervals, recovered_jumps, recovered_stalls,
+     full_lane_stats) = rescan_error_intervals_full_lane(
         video, report, samples, source_duration, templates, profile)
     samples.extend((item["video_seconds"], item["timestamp"]) for item in recovered)
-    report["jumps"].extend(recovered_jumps)
+    existing_jump_times = {
+        round(float(item["before_video_seconds"]), 3)
+        for item in report.get("jumps", [])
+    }
+    for jump in recovered_jumps:
+        key = round(float(jump["before_video_seconds"]), 3)
+        if key not in existing_jump_times:
+            report["jumps"].append(jump)
+            existing_jump_times.add(key)
+    existing_stall_times = {
+        round(float(item["video_start_seconds"]), 3)
+        for item in report.get("osd_stalls", [])
+    }
+    for stall in recovered_stalls:
+        key = round(float(stall["video_start_seconds"]), 3)
+        if key not in existing_stall_times:
+            report["osd_stalls"].append(stall)
+            existing_stall_times.add(key)
     segments = make_segments(report, samples, source_duration, error_intervals)
     source_manifest = []
     stalls = report.get("osd_stalls", [])
@@ -507,13 +790,22 @@ def process_video(video, output_root, python_executable, profiles_file, legacy_f
     index_path = output_root / f"{video.stem}.md"
     lines = [
         f"# {video.name}", "", "無劣化ストリームコピー（H.264/音声 → MOV）による分割一覧。", "",
-        f"- 使用スプリッター: `{SPLITTER_VERSION}`（15→5→2→1秒のrange-pipe方式）",
+        f"- 使用スプリッター: `{SPLITTER_VERSION}`（Fast Lane＋Full Lane救済）",
         f"- 使用Profile: `{profile['id']}`",
         f"- 元ファイル時間: `{source_duration:.3f} 秒`",
         f"- 分割後合計時間: `{output_total:.3f} 秒`",
         f"- 差分（分割後−元）: `{delta:+.3f} 秒`",
         f"- シーケンス判定: **{verdict}**（許容値 ±{tolerance:.1f}秒）", "",
-        f"- OSD認識エラー区間: `{len(error_intervals)}区間`", "",
+        f"- Fast Lane状態: VALID `{report.get('state_counts', {}).get('VALID', len(samples))}` / "
+        f"SUSPECT `{report.get('state_counts', {}).get('SUSPECT', 0)}` / "
+        f"UNKNOWN `{report.get('state_counts', {}).get('UNKNOWN', 0)}` / "
+        f"ERROR `{report.get('state_counts', {}).get('ERROR', 0)}`",
+        f"- 未解決の時系列異常区間: `{len(error_intervals)}区間`",
+        f"- Full Lane: `{full_lane_stats['pipe_windows']}窓 / "
+        f"{full_lane_stats['pipe_frames']}フレーム`、連続ギャップ `"
+        f"{full_lane_stats['continuous_gaps']}件`、時系列異常 `"
+        f"{full_lane_stats['temporal_anomalies']}件`、Full Lane内ジャンプ候補 `"
+        f"{full_lane_stats['rescued_jumps']}件`", "",
         "| No. | 出力ファイル | OSDジャンプ後の開始時刻 | 動画区間(秒) | 実時間(分) |", 
         "|---:|---|---|---:|---:|",
     ]

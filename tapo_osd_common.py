@@ -20,6 +20,14 @@ MIN_MARGIN = 80
 ROBUST_MIN_MARGIN = 80
 STALL_SECONDS = 5.0
 
+# A frame state is deliberately separate from a digit candidate.  A weak or
+# unreadable frame is not a fatal processing error; it is evidence for the
+# bounded Full Lane investigation.
+VALID = "VALID"
+SUSPECT = "SUSPECT"
+UNKNOWN = "UNKNOWN"
+ERROR = "ERROR"
+
 
 def load_templates(font_path):
     raw = json.loads(Path(font_path).read_text(encoding="utf-8"))
@@ -40,7 +48,8 @@ def _recognize_glyphs(glyphs, templates, minimum_margin):
     return timestamp, value, min(margins)
 
 
-def recognize_osd(frame, templates, profile=None):
+def _osd_gray(frame, profile=None):
+    """Extract the configured OSD crop; geometry failures are fatal errors."""
     geometry = geometry_for_profile(profile)
     roi_spec = geometry["roi"]
     if frame.shape[0] == roi_spec["height"] and frame.shape[1] == roi_spec["width"]:
@@ -52,24 +61,70 @@ def recognize_osd(frame, templates, profile=None):
         raise RuntimeError("ProfileのOSD ROIが動画フレーム範囲外です")
     # FastScan supplies the already-cropped grayscale rawvideo directly.
     # Keep accepting BGR frames for refinement and evidence paths.
-    gray = roi if roi.ndim == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return roi if roi.ndim == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+
+def _candidate_from_glyphs(glyphs, templates, method):
+    digits, margins = [], []
+    for glyph in glyphs:
+        digit, _distance, margin = recognize(glyph, templates)
+        digits.append(digit)
+        margins.append(margin)
+    value = "".join(digits)
+    try:
+        timestamp = datetime.strptime(value, "%Y%m%d%H%M%S")
+    except ValueError:
+        return {"status": SUSPECT, "reason": "INVALID_DATETIME_CANDIDATE",
+                "value": value, "margin": min(margins), "method": method}
+    margin = min(margins)
+    return {"status": VALID if margin >= MIN_MARGIN else SUSPECT,
+            "reason": "STRONG_MARGIN" if margin >= MIN_MARGIN else "LOW_MARGIN",
+            "timestamp": timestamp, "value": value, "margin": margin,
+            "method": method}
+
+
+def recognize_osd_state(frame, templates, profile=None):
+    """Classify an OSD observation without converting weak OCR into an error.
+
+    VALID is safe for Fast Lane.  SUSPECT and UNKNOWN are deliberately kept
+    for temporal investigation; ERROR is reserved for a broken profile/ROI or
+    another processing precondition, not ordinary OCR difficulty.
+    """
+    try:
+        geometry = geometry_for_profile(profile)
+        gray = _osd_gray(frame, profile)
+    except Exception as exc:
+        return {"status": ERROR, "reason": "PROFILE_OR_ROI_ERROR",
+                "details": str(exc)}
+
+    attempts = []
     try:
         glyphs, threshold = extract_glyphs_from_gray(gray, "video frame", profile)
-        timestamp, value, margin = _recognize_glyphs(glyphs, templates, MIN_MARGIN)
-        return timestamp, value, threshold, margin
-    except Exception as primary_error:
-        slots = geometry["slot_ranges"]
-        for method, extractor in (("raw_outline", extract_glyphs_from_outline),
-                                  ("contrast_outline", extract_glyphs_from_contrast_outline),
-                                  ("luma_search", extract_glyphs_from_luma_search)):
-            try:
-                glyphs = extractor(gray, slots)
-                timestamp, value, margin = _recognize_glyphs(
-                    glyphs, templates, ROBUST_MIN_MARGIN)
-                return timestamp, value, method, margin
-            except Exception:
-                continue
-        raise primary_error
+        return _candidate_from_glyphs(glyphs, templates, threshold)
+    except Exception as exc:
+        attempts.append(f"fill:{type(exc).__name__}")
+    slots = geometry["slot_ranges"]
+    for method, extractor in (("raw_outline", extract_glyphs_from_outline),
+                              ("contrast_outline", extract_glyphs_from_contrast_outline),
+                              ("luma_search", extract_glyphs_from_luma_search)):
+        try:
+            return _candidate_from_glyphs(extractor(gray, slots), templates, method)
+        except Exception as exc:
+            attempts.append(f"{method}:{type(exc).__name__}")
+    return {"status": UNKNOWN, "reason": "UNREADABLE_ALL_STAGES",
+            "details": attempts}
+
+
+def recognize_osd(frame, templates, profile=None, minimum_margin=None):
+    """Backward-compatible strict recognizer for legacy Fast Lane callers."""
+    state = recognize_osd_state(frame, templates, profile)
+    floor = MIN_MARGIN if minimum_margin is None else minimum_margin
+    if "timestamp" in state and state["margin"] >= floor:
+        return state["timestamp"], state["value"], state["method"], state["margin"]
+    raise RuntimeError(
+        f"OSD {state['status']}: {state['reason']}"
+        + (f" (margin={state['margin']})" if "margin" in state else "")
+    )
 
 
 def save_pair(output, index, before, after, delta):

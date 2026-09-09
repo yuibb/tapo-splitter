@@ -18,6 +18,7 @@ from tapo_osd_common import (
     recognize_osd,
     save_pair,
     detect_osd_stalls,
+    recognize_osd_state,
 )
 from tapo_profile import geometry_for_profile
 BASE = Path(__file__).resolve().parent
@@ -141,12 +142,24 @@ def osd_range_frames(video, start, end, step, profile=None):
         yield seconds, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-def record_from_frame(seconds, frame, templates, profile=None):
-    timestamp, value, threshold, margin = recognize_osd(frame, templates, profile)
+def record_from_frame(seconds, frame, templates, profile=None, minimum_margin=None):
+    timestamp, value, threshold, margin = recognize_osd(
+        frame, templates, profile, minimum_margin=minimum_margin)
     return {"video_seconds": seconds, "osd_digits": value,
             "formatted": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "threshold": threshold, "margin": margin,
             "frame": frame, "timestamp": timestamp}
+
+
+def state_from_frame(seconds, frame, templates, profile=None):
+    """Return a stateful observation; weak OCR remains SUSPECT/UNKNOWN."""
+    state = recognize_osd_state(frame, templates, profile)
+    state = dict(state)
+    state["video_seconds"] = seconds
+    if "timestamp" in state:
+        state["osd_digits"] = state["value"]
+        state["formatted"] = state["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    return state
 
 
 def seek_record(video, seconds, templates, profile=None):

@@ -9,7 +9,9 @@ from tapo_osd_common import load_templates, save_pair
 from tapo_profile import ProfileError, load_profile_by_id
 from ffmpeg_frame_pipeline import (
     TOLERANCE, coarse_osd_frames, range_frames, probe_duration, record_from_frame,
+    state_from_frame,
 )
+from tapo_osd_common import VALID
 
 STEP = 15.0
 
@@ -57,19 +59,31 @@ def remove_transient_ocr(items, corrections):
     return kept
 
 
-def audit_range(video, templates, lo, hi, step, total, failures, toc, corrections,
+def _reportable_state(item):
+    return {key: value for key, value in item.items()
+            if key not in {"timestamp", "frame"}}
+
+
+def audit_range(video, templates, lo, hi, step, total, non_valid, toc, corrections,
                 profile=None):
     items = []
     try:
         for seconds, frame in range_frames(video, lo, hi, step):
             try:
-                item = record_from_frame(seconds, frame, templates, profile)
-                items.append(item)
-                toc.append({k: v for k, v in item.items() if k not in {"frame", "timestamp"}})
+                state = state_from_frame(seconds, frame, templates, profile)
+                if state["status"] == VALID:
+                    item = record_from_frame(seconds, frame, templates, profile)
+                    items.append(item)
+                    toc.append({k: v for k, v in item.items()
+                                if k not in {"frame", "timestamp"}})
+                else:
+                    non_valid.append(_reportable_state(state))
             except Exception as exc:
-                failures.append({"video_seconds": seconds, "error": str(exc)})
+                non_valid.append({"video_seconds": seconds, "status": "ERROR",
+                                  "reason": "PIPE_OR_PROCESSING_ERROR", "details": str(exc)})
     except Exception as exc:
-        failures.append({"video_seconds": lo, "error": str(exc)})
+        non_valid.append({"video_seconds": lo, "status": "ERROR",
+                          "reason": "PIPE_OR_PROCESSING_ERROR", "details": str(exc)})
     items = remove_transient_ocr(items, corrections)
     anomalies = []
     for left, right in zip(items, items[1:]):
@@ -102,14 +116,19 @@ def main():
     templates = load_templates(args.font)
     total = probe_duration(args.video)
     coarse = []
-    failures = []
+    non_valid = []
     ocr_corrections = []
     for seconds, frame in coarse_osd_frames(args.video, step=args.coarse_step,
                                             profile=profile):
         try:
-            coarse.append(record_from_frame(seconds, frame, templates, profile))
+            state = state_from_frame(seconds, frame, templates, profile)
+            if state["status"] == VALID:
+                coarse.append(record_from_frame(seconds, frame, templates, profile))
+            else:
+                non_valid.append(_reportable_state(state))
         except Exception as exc:
-            failures.append({"video_seconds": seconds, "error": str(exc)})
+            non_valid.append({"video_seconds": seconds, "status": "ERROR",
+                              "reason": "PIPE_OR_PROCESSING_ERROR", "details": str(exc)})
     coarse = remove_transient_ocr(coarse, ocr_corrections)
     if not coarse:
         raise SystemExit("no recognizable coarse samples")
@@ -129,20 +148,20 @@ def main():
         refined_ranges.append([lo, hi])
         # Pass 2/3/4: only shrink and rescan ranges that remain anomalous.
         _, pass2 = audit_range(args.video, templates, lo, hi, args.refine_step,
-                               total, failures, toc, ocr_corrections, profile)
+                               total, non_valid, toc, ocr_corrections, profile)
         pass3_ranges = [(max(lo, a[0]["video_seconds"] - 2),
                          min(hi, a[1]["video_seconds"] + 2)) for a in pass2]
         pass3 = []
         for a, b in pass3_ranges:
             _, found = audit_range(args.video, templates, a, b, 2.0, total,
-                                   failures, toc, ocr_corrections, profile)
+                                   non_valid, toc, ocr_corrections, profile)
             pass3.extend(found)
         pass4_ranges = [(max(lo, a[0]["video_seconds"] - 1),
                          min(hi, a[1]["video_seconds"] + 1)) for a in pass3]
         final = []
         for a, b in pass4_ranges:
             _, found = audit_range(args.video, templates, a, b, 1.0, total,
-                                   failures, toc, ocr_corrections, profile)
+                                   non_valid, toc, ocr_corrections, profile)
             final.extend(found)
         pending_jump = None
         for left, right, vd, od in final:
@@ -181,14 +200,20 @@ def main():
         for item in toc:
             handle.write(f"{item['video_seconds']:.3f}\t{item['formatted']}\t"
                          f"{item['threshold']}\t{item['margin']}\n")
-    report = {"version": "1.3.0", "engine": "public",
+    state_counts = {status: sum(item.get("status") == status for item in non_valid)
+                    for status in ("SUSPECT", "UNKNOWN", "ERROR")}
+    report = {"version": "1.3.2", "engine": "public",
               "profile_id": args.profile_id,
               "video": str(args.video), "font": str(args.font),
               "fastscan_transport": "rawvideo-gray-osd-crop",
               "passes": [f"{args.coarse_step:g}-second OSD rawvideo FastScan",
                          f"{args.refine_step:g}-second candidate refinement",
                          "2-second refinement", "1-second final audit"],
-              "valid_samples": len(toc), "recognition_failures": failures,
+              "valid_samples": len(toc),
+              "non_valid_observations": non_valid,
+              "recognition_failures": [item for item in non_valid
+                                       if item.get("status") == "ERROR"],
+              "state_counts": {"VALID": len(toc), **state_counts},
               "ocr_transient_corrections": ocr_corrections,
               "refined_ranges": refined_ranges, "jumps": jump_events,
               "osd_stalls": stall_events, "toc_samples": samples.name}
