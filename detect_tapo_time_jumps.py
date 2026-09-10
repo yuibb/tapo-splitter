@@ -202,7 +202,7 @@ def main():
                          f"{item['threshold']}\t{item['margin']}\n")
     state_counts = {status: sum(item.get("status") == status for item in non_valid)
                     for status in ("SUSPECT", "UNKNOWN", "ERROR")}
-    report = {"version": "1.3.2", "engine": "public",
+    report = {"version": "1.3.4", "engine": "public",
               "profile_id": args.profile_id,
               "video": str(args.video), "font": str(args.font),
               "fastscan_transport": "rawvideo-gray-osd-crop",

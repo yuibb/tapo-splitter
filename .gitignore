@@ -20,6 +20,7 @@ venv/
 
 # 過去スナップショット（履歴はGitで管理）
 archive/
+backup/
 
 # Notionへ転記するためのローカル開発メモ
 tapo-splitter-development-history.md

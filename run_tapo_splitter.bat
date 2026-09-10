@@ -14,7 +14,13 @@ if not defined PYTHON (
     exit /b 1
 )
 
-%PYTHON% run_tapo_splitter.py %*
+if "%~1"=="" (
+    set "RUN_ARGS=--menu"
+) else (
+    set "RUN_ARGS=%*"
+)
+
+%PYTHON% run_tapo_splitter.py %RUN_ARGS%
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 if not "%EXIT_CODE%"=="0" (

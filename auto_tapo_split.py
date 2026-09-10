@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo production splitter using v1.3.2 Fast/Full Lane detection.
+"""Tapo production splitter using v1.3.4 Fast/Full Lane detection.
 
 Example:
   .tapo-venv/bin/python auto_tapo_split.py \
@@ -30,7 +30,7 @@ from tapo_profile import ProfileError, resolve_profile
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.3.2"
+SPLITTER_VERSION = "1.3.4"
 FULL_LANE_PADDING_SECONDS = 3.0
 FULL_LANE_STEP_SECONDS = 1.0
 FULL_LANE_DRIFT_TOLERANCE = 3.0
