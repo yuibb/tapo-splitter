@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tapo production splitter using v1.3.4 Fast/Full Lane detection.
+"""Tapo production splitter using v1.3.5 Fast/Full Lane detection.
 
 Example:
   .tapo-venv/bin/python auto_tapo_split.py \
@@ -30,7 +30,7 @@ from tapo_profile import ProfileError, resolve_profile
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.3.4"
+SPLITTER_VERSION = "1.3.5"
 FULL_LANE_PADDING_SECONDS = 3.0
 FULL_LANE_STEP_SECONDS = 1.0
 FULL_LANE_DRIFT_TOLERANCE = 3.0
@@ -682,15 +682,29 @@ def make_segments(report, samples, duration, error_intervals=None):
     return segments
 
 
+_RESERVED_OUTPUTS = set()
+
+
 def unique_path(path):
     with NAME_LOCK:
-        if not path.exists():
+        if not path.exists() and path not in _RESERVED_OUTPUTS:
+            _RESERVED_OUTPUTS.add(path)
             return path
         for suffix in range(2, 1000):
             candidate = path.with_name(f"{path.stem}_part{suffix:02d}{path.suffix}")
-            if not candidate.exists():
+            if not candidate.exists() and candidate not in _RESERVED_OUTPUTS:
+                _RESERVED_OUTPUTS.add(candidate)
                 return candidate
         raise RuntimeError(f"too many filename collisions: {path}")
+
+
+def commit_index(index_path, content, delta, tolerance=1.0):
+    """Write the completion index only after duration validation succeeds."""
+    if delta < -tolerance:
+        raise RuntimeError(
+            f"duration check failed: output is shorter by {-delta:.3f} seconds"
+        )
+    index_path.write_text(content, encoding="utf-8")
 
 
 def process_video(video, output_root, python_executable, profiles_file, legacy_font=None):
@@ -829,13 +843,13 @@ def process_video(video, output_root, python_executable, profiles_file, legacy_f
             f"{item['start_video_seconds']:.3f}–{item['end_video_seconds']:.3f} | "
             f"{item['output_duration_seconds'] / 60:.2f}（表示 {item['length_minutes_rounded']:.1f}） |"
         )
-    index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    shutil.rmtree(work)
     if delta < -tolerance:
         raise RuntimeError(
             f"duration check failed for {video.name}: "
             f"source={source_duration:.3f}s output={output_total:.3f}s delta={delta:+.3f}s"
         )
+    commit_index(index_path, "\n".join(lines) + "\n", delta, tolerance)
+    shutil.rmtree(work)
     print(f"completed: {video.name} -> {len(source_manifest)} clips, {index_path.name}")
 
 

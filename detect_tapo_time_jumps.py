@@ -2,10 +2,11 @@
 """Tapo OSD time-jump detector with temporal OCR correction and range-pipe audit."""
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 
-from tapo_osd_common import load_templates, save_pair
+from tapo_osd_common import detect_osd_stalls, load_templates, save_pair
 from tapo_profile import ProfileError, load_profile_by_id
 from ffmpeg_frame_pipeline import (
     TOLERANCE, coarse_osd_frames, range_frames, probe_duration, record_from_frame,
@@ -194,6 +195,9 @@ def main():
     jump_events = unique_events(jump_events, "before_video_seconds")
     stall_events = unique_events(stall_events, "video_start_seconds")
     toc.sort(key=lambda item: item["video_seconds"])
+    # Accumulate stall duration from the consolidated timeline rather than
+    # relying on whichever fixed refinement pass happened to contain a pair.
+    stall_events.extend(detect_osd_stalls(toc))
     samples = args.output / "toc_samples.tsv"
     with samples.open("w", encoding="utf-8") as handle:
         handle.write("video_seconds\tosd\tthreshold\tmargin\n")
@@ -202,7 +206,7 @@ def main():
                          f"{item['threshold']}\t{item['margin']}\n")
     state_counts = {status: sum(item.get("status") == status for item in non_valid)
                     for status in ("SUSPECT", "UNKNOWN", "ERROR")}
-    report = {"version": "1.3.4", "engine": "public",
+    report = {"version": "1.3.5", "engine": "public",
               "profile_id": args.profile_id,
               "video": str(args.video), "font": str(args.font),
               "fastscan_transport": "rawvideo-gray-osd-crop",
@@ -214,6 +218,12 @@ def main():
               "recognition_failures": [item for item in non_valid
                                        if item.get("status") == "ERROR"],
               "state_counts": {"VALID": len(toc), **state_counts},
+              "stage_counts": {
+                  "valid": dict(Counter(item.get("stage", "unknown") for item in toc)),
+                  "suspect": dict(Counter(item.get("stage", "unreadable")
+                                            for item in non_valid
+                                            if item.get("status") == "SUSPECT")),
+              },
               "ocr_transient_corrections": ocr_corrections,
               "refined_ranges": refined_ranges, "jumps": jump_events,
               "osd_stalls": stall_events, "toc_samples": samples.name}

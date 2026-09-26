@@ -15,7 +15,9 @@ evidence for geometry checks and for rebuilding the font later.
 
 import argparse
 import json
+import os
 import random
+import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -251,13 +253,62 @@ def build_geometry_baseline(frame_records):
     }
 
 
+def _partial_path(path):
+    return path.with_name(path.name + ".partial")
+
+
+def _write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def validate_font_data(data, target, candidate_minimum, profile_id=None):
+    """Reject partial or structurally incomplete fonts before publication."""
+    if data.get("format") != "tapo_osd_glyph_templates_v1":
+        raise ValueError("unsupported font format")
+    if data.get("selected_per_digit") != target:
+        raise ValueError("selected_per_digit does not match the requested target")
+    if data.get("candidate_minimum_per_digit") != candidate_minimum:
+        raise ValueError("candidate minimum does not match the requested target")
+    if profile_id is not None and data.get("profile_id") != profile_id:
+        raise ValueError("font profile_id does not match the requested profile")
+    digits = data.get("digits", {})
+    for digit in "0123456789":
+        bucket = digits.get(digit, {})
+        templates = bucket.get("templates", [])
+        if len(templates) < target:
+            raise ValueError(f"digit {digit} has only {len(templates)} templates")
+        if bucket.get("candidate_count", 0) < candidate_minimum:
+            raise ValueError(f"digit {digit} has too few candidates")
+        if len(bucket.get("template_sources", [])) != len(templates):
+            raise ValueError(f"digit {digit} template sources are incomplete")
+        for matrix in templates:
+            if len(matrix) != 64 or any(len(row) != 40 for row in matrix):
+                raise ValueError(f"digit {digit} contains an invalid template matrix")
+    return True
+
+
 def write_json(path, labels, candidates, frame_records, target=SELECTED_PER_DIGIT,
-               candidate_minimum=CANDIDATE_MINIMUM, attempts=0, profile_id=None):
+               candidate_minimum=CANDIDATE_MINIMUM, attempts=0, profile_id=None,
+               complete=False):
     selected = {digit: select_elite(candidates[digit], target) for digit in "0123456789"}
     data = {
         "format": "tapo_osd_glyph_templates_v1",
         "builder": "EliteFontBuilder",
-        "builder_version": "1.3.0",
+        "builder_version": "1.3.5",
         "profile_id": profile_id,
         "label_source": "user-confirmed OSD strings from recordings",
         "label_assistant": "tapo_osd_seed.json for provisional labels; user confirmation for ambiguous frames",
@@ -288,7 +339,14 @@ def write_json(path, labels, candidates, frame_records, target=SELECTED_PER_DIGI
             for digit in "0123456789"
         },
     }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if complete:
+        validate_font_data(data, target, candidate_minimum, profile_id)
+        _write_json_atomic(path, data)
+        partial = _partial_path(path)
+        if partial.exists():
+            partial.unlink()
+    else:
+        _write_json_atomic(_partial_path(path), data)
 
 
 def load_existing(path):
@@ -422,7 +480,7 @@ def main():
         if all(counts[digit] >= args.candidate_minimum for digit in "0123456789"):
             write_json(args.output, labels, candidates, frame_records,
                        args.selected_per_digit, args.candidate_minimum, attempts,
-                       args.profile_id)
+                       args.profile_id, complete=True)
             print(f"完成: {args.output}")
             print("候補数:", counts)
             print("最終Elite数:", {digit: args.selected_per_digit for digit in "0123456789"})
