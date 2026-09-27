@@ -101,6 +101,54 @@ def coarse_osd_frames(video, step=STEP, profile=None):
         ).reshape((roi["height"], roi["width"]))
 
 
+def sampling_targets(duration, step=STEP):
+    """Return the requested sparse timestamps without decoding the gaps."""
+    targets = []
+    current = 0.0
+    while current <= duration + 1e-6:
+        targets.append(round(current, 3))
+        current += float(step)
+    return targets
+
+
+def seek_osd_frame(video, seconds, profile=None):
+    """Seek to one sparse target and return its actual PTS plus OSD crop."""
+    geometry = geometry_for_profile(profile)
+    roi = geometry["roi"]
+    command = ffmpeg_command(
+        "-v", "info", "-copyts", "-ss", f"{seconds:.3f}", "-i", str(video),
+        "-an", "-sn", "-vf",
+        (f"crop={roi['width']}:{roi['height']}:{roi['x']}:{roi['y']},"
+         "format=gray,showinfo"),
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    )
+    result = subprocess.run(command, check=True, capture_output=True)
+    match = re.search(rb"pts_time:([-+]?[0-9]+(?:\.[0-9]+)?)", result.stderr)
+    frame_size = roi["width"] * roi["height"]
+    if not match or len(result.stdout) != frame_size:
+        raise RuntimeError(f"missing OSD frame or PTS at {seconds:.3f}s")
+    frame = np.frombuffer(result.stdout, dtype=np.uint8).reshape(
+        (roi["height"], roi["width"]))
+    return float(match.group(1)), frame
+
+
+def coarse_osd_frames_seek(video, step=STEP, profile=None, failures=None):
+    """Read sparse OSD samples with input-side seek instead of full decode."""
+    duration = probe_duration(video)
+    for target in sampling_targets(duration, step):
+        try:
+            seconds, gray = seek_osd_frame(video, target, profile)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+            if failures is not None:
+                failures.append({"target_seconds": target,
+                                 "video_seconds": target,
+                                 "status": "ERROR",
+                                 "reason": "COARSE_SEEK_FAILED",
+                                 "details": str(exc)})
+            continue
+        yield seconds, gray
+
+
 def range_frames(video, start, end, step):
     """Read a bounded time range through one ffmpeg pipe at a fixed interval."""
     command = ffmpeg_command(

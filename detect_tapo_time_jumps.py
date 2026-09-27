@@ -9,8 +9,8 @@ from pathlib import Path
 from tapo_osd_common import detect_osd_stalls, load_templates, save_pair
 from tapo_profile import ProfileError, load_profile_by_id
 from ffmpeg_frame_pipeline import (
-    TOLERANCE, coarse_osd_frames, range_frames, probe_duration, record_from_frame,
-    state_from_frame,
+    TOLERANCE, coarse_osd_frames_seek, range_frames, probe_duration,
+    record_from_frame, sampling_targets, state_from_frame,
 )
 from tapo_osd_common import VALID
 
@@ -24,6 +24,92 @@ def unique_events(events, key):
             continue
         out.append(event)
     return out
+
+
+def plan_ranges(ranges):
+    """Merge overlapping/contained ranges within one pass only."""
+    ordered = sorted(
+        ({"start": float(item["start"]), "end": float(item["end"]),
+          "source_index": index} for index, item in enumerate(ranges)
+         if float(item["end"]) > float(item["start"])),
+        key=lambda item: (item["start"], item["end"]),
+    )
+    planned = []
+    for item in ordered:
+        if not planned or item["start"] > planned[-1]["end"]:
+            planned.append({"start": item["start"], "end": item["end"],
+                            "source_indices": [item["source_index"]]})
+            continue
+        planned[-1]["end"] = max(planned[-1]["end"], item["end"])
+        planned[-1]["source_indices"].append(item["source_index"])
+    return planned
+
+
+def _anomalies_from_items(items):
+    anomalies = []
+    for left, right in zip(items, items[1:]):
+        video_delta = right["video_seconds"] - left["video_seconds"]
+        if video_delta <= 0:
+            continue
+        osd_delta = (right["timestamp"] - left["timestamp"]).total_seconds()
+        if abs(osd_delta - video_delta) > TOLERANCE:
+            anomalies.append((left, right, video_delta, osd_delta))
+    return anomalies
+
+
+def audit_planned_ranges(video, templates, ranges, step, total, non_valid, toc,
+                         corrections, profile=None):
+    """Audit a pass after merging only overlapping logical windows.
+
+    The physical range is decoded once.  Its observations are then projected
+    back onto each logical source window before transient OCR cleanup, so the
+    existing temporal semantics remain local to the original window.
+    """
+    planned = plan_ranges(ranges)
+    anomalies = []
+    seen = set()
+    for physical in planned:
+        items, _ = audit_range(
+            video, templates, physical["start"], physical["end"], step, total,
+            non_valid, toc, corrections, profile, apply_transient=False,
+        )
+        for source_index in physical["source_indices"]:
+            source = ranges[source_index]
+            local = [item for item in items
+                     if source["start"] - 1e-6 <= item["video_seconds"]
+                     <= source["end"] + 1e-6]
+            local = remove_transient_ocr(local, corrections)
+            for anomaly in _anomalies_from_items(local):
+                key = (round(anomaly[0]["video_seconds"], 6),
+                       round(anomaly[1]["video_seconds"], 6),
+                       round(anomaly[2], 6), round(anomaly[3], 6))
+                if key not in seen:
+                    seen.add(key)
+                    anomalies.append(anomaly)
+    return anomalies, {
+        "step": float(step),
+        "logical_ranges": [{"start": item["start"], "end": item["end"]}
+                            for item in ranges],
+        "physical_ranges": planned,
+        "logical_range_count": len(ranges),
+        "physical_range_count": len(planned),
+        "merge_count": max(0, len(ranges) - len(planned)),
+    }
+
+
+def _ranges_from_anomalies(anomalies, source_ranges, padding, total):
+    """Create the next pass windows while retaining the source bounds."""
+    ranges = []
+    for left, right, _video_delta, _osd_delta in anomalies:
+        containing = [item for item in source_ranges
+                      if item["start"] - 1e-6 <= left["video_seconds"]
+                      and right["video_seconds"] <= item["end"] + 1e-6]
+        bound = min(containing, key=lambda item: item["end"] - item["start"])
+        ranges.append({
+            "start": max(0.0, bound["start"], left["video_seconds"] - padding),
+            "end": min(total, bound["end"], right["video_seconds"] + padding),
+        })
+    return ranges
 
 
 def remove_transient_ocr(items, corrections):
@@ -66,7 +152,7 @@ def _reportable_state(item):
 
 
 def audit_range(video, templates, lo, hi, step, total, non_valid, toc, corrections,
-                profile=None):
+                profile=None, apply_transient=True):
     items = []
     try:
         for seconds, frame in range_frames(video, lo, hi, step):
@@ -85,16 +171,9 @@ def audit_range(video, templates, lo, hi, step, total, non_valid, toc, correctio
     except Exception as exc:
         non_valid.append({"video_seconds": lo, "status": "ERROR",
                           "reason": "PIPE_OR_PROCESSING_ERROR", "details": str(exc)})
-    items = remove_transient_ocr(items, corrections)
-    anomalies = []
-    for left, right in zip(items, items[1:]):
-        vd = right["video_seconds"] - left["video_seconds"]
-        if vd <= 0:
-            continue
-        od = (right["timestamp"] - left["timestamp"]).total_seconds()
-        if abs(od - vd) > TOLERANCE:
-            anomalies.append((left, right, vd, od))
-    return items, anomalies
+    if apply_transient:
+        items = remove_transient_ocr(items, corrections)
+    return items, _anomalies_from_items(items)
 
 
 def main():
@@ -119,8 +198,10 @@ def main():
     coarse = []
     non_valid = []
     ocr_corrections = []
-    for seconds, frame in coarse_osd_frames(args.video, step=args.coarse_step,
-                                            profile=profile):
+    coarse_seek_failures = []
+    for seconds, frame in coarse_osd_frames_seek(args.video, step=args.coarse_step,
+                                                 profile=profile,
+                                                 failures=coarse_seek_failures):
         try:
             state = state_from_frame(seconds, frame, templates, profile)
             if state["status"] == VALID:
@@ -130,6 +211,7 @@ def main():
         except Exception as exc:
             non_valid.append({"video_seconds": seconds, "status": "ERROR",
                               "reason": "PIPE_OR_PROCESSING_ERROR", "details": str(exc)})
+    non_valid.extend(coarse_seek_failures)
     coarse = remove_transient_ocr(coarse, ocr_corrections)
     if not coarse:
         raise SystemExit("no recognizable coarse samples")
@@ -139,6 +221,7 @@ def main():
     jump_events = []
     stall_events = []
     refined_ranges = []
+    coarse_windows = []
     for before, after in zip(coarse, coarse[1:]):
         video_delta = after["video_seconds"] - before["video_seconds"]
         osd_delta = (after["timestamp"] - before["timestamp"]).total_seconds()
@@ -147,50 +230,68 @@ def main():
         lo = max(0.0, before["video_seconds"] - 5.0)
         hi = min(total, after["video_seconds"] + 5.0)
         refined_ranges.append([lo, hi])
-        # Pass 2/3/4: only shrink and rescan ranges that remain anomalous.
-        _, pass2 = audit_range(args.video, templates, lo, hi, args.refine_step,
-                               total, non_valid, toc, ocr_corrections, profile)
-        pass3_ranges = [(max(lo, a[0]["video_seconds"] - 2),
-                         min(hi, a[1]["video_seconds"] + 2)) for a in pass2]
-        pass3 = []
-        for a, b in pass3_ranges:
-            _, found = audit_range(args.video, templates, a, b, 2.0, total,
-                                   non_valid, toc, ocr_corrections, profile)
-            pass3.extend(found)
-        pass4_ranges = [(max(lo, a[0]["video_seconds"] - 1),
-                         min(hi, a[1]["video_seconds"] + 1)) for a in pass3]
-        final = []
-        for a, b in pass4_ranges:
-            _, found = audit_range(args.video, templates, a, b, 1.0, total,
-                                   non_valid, toc, ocr_corrections, profile)
-            final.extend(found)
-        pending_jump = None
-        for left, right, vd, od in final:
-            drift = od - vd
-            if left["osd_digits"] == right["osd_digits"] and vd >= 5:
-                stall_events.append({"video_start_seconds": left["video_seconds"],
-                                     "video_end_seconds": right["video_seconds"],
-                                     "duration_seconds": vd, "osd": left["formatted"]})
-                continue
-            if pending_jump is not None:
-                if abs(drift + pending_jump["drift"]) <= TOLERANCE:
-                    pending_jump = None
-                    continue
-                jump_events.append(save_pair(args.output, len(jump_events) + 1,
-                    pending_jump["left"], pending_jump["right"],
-                    {"video_elapsed_seconds": pending_jump["vd"],
-                     "osd_elapsed_seconds": pending_jump["od"],
-                     "jump_seconds": pending_jump["drift"]}))
-                pending_jump = None
-            if left["osd_digits"] != right["osd_digits"]:
-                pending_jump = {"left": left, "right": right,
-                                "vd": vd, "od": od, "drift": drift}
+        coarse_windows.append({"start": lo, "end": hi})
+
+    # Pass 2/3/4: collect all logical windows for the pass, merge only
+    # overlapping/contained windows, then reuse the existing Short Range Pipe.
+    planner_passes = []
+    pass2, planner = audit_planned_ranges(
+        args.video, templates, coarse_windows, args.refine_step, total,
+        non_valid, toc, ocr_corrections, profile,
+    ) if coarse_windows else ([], {"step": args.refine_step,
+                                   "logical_ranges": [], "physical_ranges": [],
+                                   "logical_range_count": 0,
+                                   "physical_range_count": 0, "merge_count": 0})
+    planner["pass"] = f"refine_{args.refine_step:g}"
+    planner_passes.append(planner)
+
+    pass3_ranges = _ranges_from_anomalies(pass2, coarse_windows, 2.0, total)
+    pass3, planner = audit_planned_ranges(
+        args.video, templates, pass3_ranges, 2.0, total,
+        non_valid, toc, ocr_corrections, profile,
+    ) if pass3_ranges else ([], {"step": 2.0, "logical_ranges": [],
+                                 "physical_ranges": [], "logical_range_count": 0,
+                                 "physical_range_count": 0, "merge_count": 0})
+    planner["pass"] = "refine_2"
+    planner_passes.append(planner)
+
+    pass4_ranges = _ranges_from_anomalies(pass3, pass3_ranges, 1.0, total)
+    final, planner = audit_planned_ranges(
+        args.video, templates, pass4_ranges, 1.0, total,
+        non_valid, toc, ocr_corrections, profile,
+    ) if pass4_ranges else ([], {"step": 1.0, "logical_ranges": [],
+                                 "physical_ranges": [], "logical_range_count": 0,
+                                 "physical_range_count": 0, "merge_count": 0})
+    planner["pass"] = "refine_1"
+    planner_passes.append(planner)
+
+    pending_jump = None
+    for left, right, vd, od in final:
+        drift = od - vd
+        if left["osd_digits"] == right["osd_digits"] and vd >= 5:
+            stall_events.append({"video_start_seconds": left["video_seconds"],
+                                 "video_end_seconds": right["video_seconds"],
+                                 "duration_seconds": vd, "osd": left["formatted"]})
+            continue
         if pending_jump is not None:
+            if abs(drift + pending_jump["drift"]) <= TOLERANCE:
+                pending_jump = None
+                continue
             jump_events.append(save_pair(args.output, len(jump_events) + 1,
                 pending_jump["left"], pending_jump["right"],
                 {"video_elapsed_seconds": pending_jump["vd"],
                  "osd_elapsed_seconds": pending_jump["od"],
                  "jump_seconds": pending_jump["drift"]}))
+            pending_jump = None
+        if left["osd_digits"] != right["osd_digits"]:
+            pending_jump = {"left": left, "right": right,
+                            "vd": vd, "od": od, "drift": drift}
+    if pending_jump is not None:
+        jump_events.append(save_pair(args.output, len(jump_events) + 1,
+            pending_jump["left"], pending_jump["right"],
+            {"video_elapsed_seconds": pending_jump["vd"],
+             "osd_elapsed_seconds": pending_jump["od"],
+             "jump_seconds": pending_jump["drift"]}))
 
     jump_events = unique_events(jump_events, "before_video_seconds")
     stall_events = unique_events(stall_events, "video_start_seconds")
@@ -206,11 +307,18 @@ def main():
                          f"{item['threshold']}\t{item['margin']}\n")
     state_counts = {status: sum(item.get("status") == status for item in non_valid)
                     for status in ("SUSPECT", "UNKNOWN", "ERROR")}
-    report = {"version": "1.3.5", "engine": "public",
+    report = {"version": "1.4.0", "engine": "public",
               "profile_id": args.profile_id,
               "video": str(args.video), "font": str(args.font),
-              "fastscan_transport": "rawvideo-gray-osd-crop",
-              "passes": [f"{args.coarse_step:g}-second OSD rawvideo FastScan",
+              "fastscan_transport": "per-sample-input-seek-rawvideo-gray-osd-crop",
+              "coarse_transport": {
+                  "method": "per-sample-input-seek",
+                  "step": args.coarse_step,
+                  "target_count": len(sampling_targets(total, args.coarse_step)),
+                  "seek_count": len(sampling_targets(total, args.coarse_step)),
+                  "failed_targets": len(coarse_seek_failures),
+              },
+              "passes": [f"{args.coarse_step:g}-second OSD per-sample Seek",
                          f"{args.refine_step:g}-second candidate refinement",
                          "2-second refinement", "1-second final audit"],
               "valid_samples": len(toc),
@@ -225,7 +333,15 @@ def main():
                                             if item.get("status") == "SUSPECT")),
               },
               "ocr_transient_corrections": ocr_corrections,
-              "refined_ranges": refined_ranges, "jumps": jump_events,
+              "refined_ranges": refined_ranges,
+              "batch_planner": {
+                  "merge_policy": "overlap-and-containment-only",
+                  "cross_pass_merge": False,
+                  "near_gap_merge": False,
+                  "passes": planner_passes,
+                  "merge_count": sum(item["merge_count"] for item in planner_passes),
+              },
+              "jumps": jump_events,
               "osd_stalls": stall_events, "toc_samples": samples.name}
     path = args.output / "time_jump_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
