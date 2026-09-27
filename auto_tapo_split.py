@@ -30,7 +30,7 @@ from tapo_profile import ProfileError, resolve_profile
 BASE = Path(__file__).resolve().parent
 DETECTOR = BASE / "detect_tapo_time_jumps.py"
 FONT = BASE / "tapo_osd_glyph_templates.json"
-SPLITTER_VERSION = "1.4.0"
+SPLITTER_VERSION = "1.4.1"
 FULL_LANE_PADDING_SECONDS = 3.0
 FULL_LANE_STEP_SECONDS = 1.0
 FULL_LANE_DRIFT_TOLERANCE = 3.0

@@ -8,6 +8,7 @@ from tapo_profile import geometry_for_profile
 
 CANVAS_H, CANVAS_W = 64, 40
 THRESHOLDS = (225, 235, 240, 245, 250)
+_POPCOUNT8 = np.array([value.bit_count() for value in range(256)], dtype=np.uint8)
 
 
 def normalize(mask):
@@ -83,6 +84,7 @@ def shifted_hamming(a, b):
 
 
 _TEMPLATE_CACHE = {}
+_PACKED_TEMPLATE_CACHE = {}
 
 
 def _shifted_variants(glyph):
@@ -115,26 +117,47 @@ def _prepared_templates(templates):
     return prepared[1:]
 
 
-def recognize(glyph, templates):
-    digits, stacks, bank = _prepared_templates(templates)
-    shifted = _shifted_variants(glyph)
+def _packed_templates(templates):
+    """Cache bit-packed templates for exact Hamming-distance evaluation."""
+    key = id(templates)
+    cached = _PACKED_TEMPLATE_CACHE.get(key)
+    if cached is not None and cached[0] is templates:
+        return cached[1:]
 
-    if bank is not None:
-        # Shape: shifts × digits × templates × pixels.
-        distances = np.count_nonzero(
-            shifted[:, None, None, :, :] != bank[None, :, :, :, :],
-            axis=(3, 4),
-        )
+    digits, stacks, bank = _prepared_templates(templates)
+    packed_stacks = tuple(
+        np.packbits(stack.reshape(stack.shape[0], -1), axis=1, bitorder="big")
+        for stack in stacks
+    )
+    packed_bank = None if bank is None else np.packbits(
+        bank.reshape(bank.shape[0], bank.shape[1], -1), axis=2, bitorder="big"
+    )
+    prepared = (templates, digits, packed_stacks, packed_bank)
+    _PACKED_TEMPLATE_CACHE[key] = prepared
+    return prepared[1:]
+
+
+def recognize(glyph, templates):
+    digits, packed_stacks, packed_bank = _packed_templates(templates)
+    shifted = _shifted_variants(glyph)
+    packed_shifted = np.packbits(
+        shifted.reshape(shifted.shape[0], -1), axis=1, bitorder="big"
+    )
+
+    if packed_bank is not None:
+        # Shape: shifts × digits × templates × packed pixels.
+        distances = _POPCOUNT8[np.bitwise_xor(
+            packed_shifted[:, None, None, :], packed_bank[None, :, :, :]
+        )].sum(axis=-1, dtype=np.int32)
         best_by_digit = distances.min(axis=(0, 2))
         scores = [(int(best), digit) for best, digit in zip(best_by_digit, digits)]
     else:
         # Keep compatibility with legacy JSON files with uneven template counts.
         scores = []
-        for digit, stack in zip(digits, stacks):
-            distances = np.count_nonzero(
-                shifted[:, None, :, :] != stack[None, :, :, :],
-                axis=(2, 3),
-            )
+        for digit, stack in zip(digits, packed_stacks):
+            distances = _POPCOUNT8[np.bitwise_xor(
+                packed_shifted[:, None, :], stack[None, :, :]
+            )].sum(axis=-1, dtype=np.int32)
             scores.append((int(distances.min()), digit))
     scores.sort()
     best, digit = scores[0]
